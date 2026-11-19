@@ -598,6 +598,9 @@ pub struct Rings {
     pace: ring::Pace,
     /// The task's clock.
     clock: Clock,
+    /// Each batch's function time, from its take to its release less the waits for the engine
+    /// (for a window, or for input), which its release carries (item 6.3z).
+    pieces: ring::PieceTimes,
     /// A batch taken while no window was free, and the part of its answer to write next.
     pending: Option<(ring::InEntry, u32)>,
 }
@@ -683,7 +686,8 @@ impl Rings {
             let _ = crate::datapath::pin_current_thread(Some(cpu));
         }
         let clock = Clock::map();
-        let pace = ring::Pace::new(half.head(&rings), clock.now());
+        let now = clock.now();
+        let pace = ring::Pace::new(half.head(&rings), now);
         Ok(Rings {
             region,
             rings,
@@ -693,6 +697,7 @@ impl Rings {
             sleeps: 0,
             pace,
             clock,
+            pieces: ring::PieceTimes::new(now),
             pending: None,
         })
     }
@@ -708,6 +713,7 @@ impl Rings {
         let Some(e) = self.half.next(&self.rings).map_err(broken)? else {
             return Ok(None);
         };
+        self.pieces.took(self.clock.now());
         let at = self.region.range(e.offset, e.len as usize)?;
         // SAFETY: the region is mapped read only for as long as the task lives (slot 0 is
         // never asked again), the engine writes no span it has posted until the task
@@ -717,9 +723,14 @@ impl Rings {
     }
 
     /// Releases the oldest batch taken: the task is done with it, and every record posted
-    /// before answers it. Rings the engine's bell, which waits for the release.
+    /// before answers it. The release carries the batch's function time (item 6.3z). Rings the
+    /// engine's bell, which waits for the release.
     pub fn release(&mut self) -> bool {
-        let released = self.half.release(&self.rings);
+        if self.half.held() == 0 {
+            return false;
+        }
+        let piece_ns = self.pieces.released(self.clock.now());
+        let released = self.half.release_timed(&self.rings, piece_ns);
         if released && self.half.ring(&self.rings) {
             self.wakes += 1;
         }
@@ -779,8 +790,15 @@ impl Rings {
 
     /// Waits on the task's bell until the next batch or the end (the input ring is empty):
     /// lingers while the engine is posting, otherwise sleeps with no deadline, the engine's wake
-    /// reaching the bell of the shared object (see [`Rings`]).
+    /// reaching the bell of the shared object (see [`Rings`]). The wait is the engine's time, not
+    /// that of any batch the task holds (item 6.3z).
     pub fn wait_input(&mut self) {
+        self.pieces.wait_begins(self.clock.now());
+        self.await_input();
+        self.pieces.wait_ends(self.clock.now());
+    }
+
+    fn await_input(&mut self) {
         for _ in 0..self.spins {
             if self.half.has_input(&self.rings) {
                 return;
@@ -797,8 +815,15 @@ impl Rings {
         self.sleeps += u64::from(calls);
     }
 
-    /// Sleeps on the task's bell until the engine gives a window (none is free).
+    /// Sleeps on the task's bell until the engine gives a window (none is free). The wait is the
+    /// engine's time, not any batch's (item 6.3z).
     pub fn wait_window(&mut self) {
+        self.pieces.wait_begins(self.clock.now());
+        self.await_window();
+        self.pieces.wait_ends(self.clock.now());
+    }
+
+    fn await_window(&mut self) {
         for _ in 0..self.spins {
             if self.half.has_window(&self.rings) {
                 return;
@@ -833,7 +858,10 @@ impl Rings {
         let (entry, mut part) = match self.pending.take() {
             Some(p) => p,
             None => match self.half.next(&self.rings).map_err(broken)? {
-                Some(e) => (e, 0),
+                Some(e) => {
+                    self.pieces.took(self.clock.now());
+                    (e, 0)
+                }
                 None if self.half.ended(&self.rings) => return Ok(Step::Ended),
                 None => return Ok(Step::NoInput),
             },

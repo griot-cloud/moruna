@@ -43,6 +43,16 @@
 //! The task says its exit code in the control page before it ends ([`Task::exit`]): a task the
 //! engine starts itself has no other way to tell it.
 //!
+//! **A release carries the piece's time** (item 6.3z). A task that attached at
+//! [`layout::ATTACHED_TIMED`] writes the function time it spent on a batch ([`PieceTimes`]) into
+//! the batch's input entry, in its `rows` word ([`layout::IN_PIECE_NS`]), before it stores the
+//! release: no layout change, since the engine never reads an entry back (it keeps its own
+//! copies) and posts into the entry's slot again only after the release has passed it. The engine
+//! reads that word only from a task that attached so, and only for an input it has seen released
+//! and not yet posted over ([`Engine::piece_ns`]); every other task's release has no time. An
+//! engine of before never reads the word, and a task of before (the Python shim's) attaches at
+//! [`layout::VERSION_VALUE`].
+//!
 //! The task can write every byte of the rings object, so the engine never reads back a word
 //! it wrote: it keeps its own copies, and checks every word the task writes against them
 //! before it believes it ([`Bad`] when a word could not be true). No word the task writes can
@@ -102,7 +112,8 @@ pub mod layout {
     pub const TASK_WAITS: usize = 576;
     /// Nonzero once the engine posts no more input.
     pub const CLOSED: usize = 640;
-    /// The protocol version the task attached with.
+    /// The protocol version the task attached with: [`VERSION_VALUE`] for a task of before,
+    /// [`ATTACHED_TIMED`] for one whose releases carry its piece's time.
     pub const ATTACHED: usize = 704;
     /// The task's bell: a 32-bit futex word (the low half of this word) the engine raises
     /// after it posts, gives a window or closes, and wakes when the task waits on it.
@@ -125,6 +136,18 @@ pub mod layout {
     pub const OUT_ENTRY: usize = 32;
     /// A free entry: a window's number.
     pub const FREE_ENTRY: usize = 8;
+
+    /// [`ATTACHED`] of a task whose releases carry its piece's time (item 6.3z): the header's
+    /// [`VERSION_VALUE`] stays 4, so a task of before still attaches, and only the version the
+    /// task says it attached with rises.
+    pub const ATTACHED_TIMED: u64 = 5;
+    /// The word of an input entry, from the entry's start, that a task attached at
+    /// [`ATTACHED_TIMED`] writes as it releases the entry: the piece's function time in
+    /// nanoseconds, or [`NO_TIME`]. It is the entry's `rows`, which neither side needs once the
+    /// task has taken the entry.
+    pub const IN_PIECE_NS: usize = 24;
+    /// [`IN_PIECE_NS`] of a release the task has no time for.
+    pub const NO_TIME: u64 = u64::MAX;
 
     /// One page.
     pub const PAGE: u64 = 4096;
@@ -509,6 +532,26 @@ impl Engine {
         Ok(n)
     }
 
+    /// The function time, in nanoseconds, the task gave input `index` (its posting order, from 0)
+    /// as it released it (item 6.3z): its entry's [`IN_PIECE_NS`] word, read only from a task that
+    /// attached at [`ATTACHED_TIMED`] or above, and only once [`Engine::released`] has seen the
+    /// release pass the entry and before the engine posts into its slot again. `None` for any other
+    /// task, any other input, and a release the task gave no time.
+    pub fn piece_ns(&self, s: &impl Shared, index: u64) -> Option<u64> {
+        let g = &self.geometry;
+        if index >= self.in_tail || self.in_head > index.saturating_add(g.in_cap) {
+            return None;
+        }
+        if s.load(ATTACHED) < ATTACHED_TIMED {
+            return None;
+        }
+        let at = g.in_entries() + (index % g.in_cap) as usize * IN_ENTRY + IN_PIECE_NS;
+        match s.load(at) {
+            NO_TIME => None,
+            ns => Some(ns),
+        }
+    }
+
     /// Gives window `w`; `false` when the free ring is full.
     pub fn give(&mut self, s: &impl Shared, w: u64) -> Result<bool, Bad> {
         self.given(s)?;
@@ -835,7 +878,8 @@ impl Task {
             engine_bell: s.load(ENGINE_BELL) as u32,
             note: s.load(TASK_NOTE),
         };
-        s.store(ATTACHED, VERSION_VALUE);
+        // Its releases carry its pieces' times (item 6.3z).
+        s.store(ATTACHED, ATTACHED_TIMED);
         Ok(t)
     }
 
@@ -879,14 +923,30 @@ impl Task {
     }
 
     /// Releases the oldest input taken: the task is done with it, and every record it posted
-    /// before answers it.
+    /// before answers it. The release carries no time ([`Task::release_timed`]).
     pub fn release(&mut self, s: &impl Shared) -> bool {
+        self.release_timed(s, None)
+    }
+
+    /// [`Task::release`], with the piece's function time in nanoseconds, if the task has one
+    /// ([`PieceTimes`]): written into the entry's [`IN_PIECE_NS`] word before the release is
+    /// stored, so the engine that reads the release reads the time with it. A time of
+    /// [`NO_TIME`] or more is given as `NO_TIME - 1`.
+    pub fn release_timed(&mut self, s: &impl Shared, piece_ns: Option<u64>) -> bool {
         if self.in_tail == self.in_next {
             return false;
         }
+        let g = &self.geometry;
+        let at = g.in_entries() + (self.in_tail % g.in_cap) as usize * IN_ENTRY + IN_PIECE_NS;
+        s.store(at, piece_ns.map_or(NO_TIME, |ns| ns.min(NO_TIME - 1)));
         self.in_tail += 1;
         s.store(IN_TAIL, self.in_tail);
         true
+    }
+
+    /// Inputs taken and not yet released.
+    pub fn held(&self) -> u64 {
+        self.in_next - self.in_tail
     }
 
     /// Whether the engine posts no more and every input was taken.
@@ -1154,5 +1214,117 @@ impl Pace {
             }
             _ => Rest::Sleep(forever),
         }
+    }
+}
+
+/// The most batches a task times at once ([`PieceTimes`]): the input ring's capacity as
+/// [`Geometry::new`] makes it. A batch taken while this many are held goes untimed.
+pub const TIMED_MAX: usize = 64;
+
+/// A task's measure of each piece's function time (item 6.3z), on its own clock: from its take
+/// of a batch off the input ring to its release of it, less its waits for the engine (for a free
+/// window, or for input while it holds batches), which are the engine's time.
+///
+/// The task's time is shared among the batches it holds: between two events (a take, a release,
+/// the start or the end of a wait for the engine) the time elapsed is split evenly among the
+/// batches held then, the odd nanoseconds to the oldest, and a wait adds nothing to any. So the
+/// times of the batches a task held sum to the time it was busy holding them, never its waiting,
+/// however many it held at once, and a task that holds one batch at a time gives each its own
+/// time.
+///
+/// It keeps [`TIMED_MAX`] batches' times at most: a batch taken past them goes untimed, as does
+/// every batch behind it until the oldest timed are released.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct PieceTimes {
+    /// When the time since was last shared out.
+    at: u64,
+    /// In a wait for the engine: the time since is no batch's.
+    waiting: bool,
+    /// The held batches' times, oldest first, as a ring from `first`: `None` for one untimed.
+    times: [Option<u64>; TIMED_MAX],
+    first: usize,
+    /// Batches held with a place in `times`.
+    kept: usize,
+    /// Batches held past them, the newest, all untimed.
+    past: u64,
+}
+
+impl PieceTimes {
+    /// A measure that starts at `now`, holding no batch.
+    pub fn new(now: u64) -> PieceTimes {
+        PieceTimes {
+            at: now,
+            waiting: false,
+            times: [None; TIMED_MAX],
+            first: 0,
+            kept: 0,
+            past: 0,
+        }
+    }
+
+    /// Batches held.
+    pub fn held(&self) -> u64 {
+        self.kept as u64 + self.past
+    }
+
+    /// Shares the time from the last event to `now` among the batches held, unless the task waits
+    /// for the engine.
+    fn share(&mut self, now: u64) {
+        let elapsed = now.saturating_sub(self.at);
+        self.at = self.at.max(now);
+        let held = self.held();
+        if self.waiting || held == 0 || elapsed == 0 {
+            return;
+        }
+        let (each, odd) = (elapsed / held, elapsed % held);
+        for k in 0..self.kept {
+            let slot = &mut self.times[(self.first + k) % TIMED_MAX];
+            let add = if k == 0 { each + odd } else { each };
+            *slot = slot.map(|t| t.saturating_add(add));
+        }
+    }
+
+    /// The task took a batch off its input ring at `now`.
+    pub fn took(&mut self, now: u64) {
+        self.share(now);
+        // Batches are held past the kept ones only while every place is taken.
+        if self.kept < TIMED_MAX {
+            self.times[(self.first + self.kept) % TIMED_MAX] = Some(0);
+            self.kept += 1;
+        } else {
+            self.past += 1;
+        }
+    }
+
+    /// The task releases its oldest batch at `now`: its time, `None` when it went untimed or no
+    /// batch is held.
+    pub fn released(&mut self, now: u64) -> Option<u64> {
+        self.share(now);
+        if self.kept == 0 {
+            return None;
+        }
+        let time = self.times[self.first].take();
+        self.first = (self.first + 1) % TIMED_MAX;
+        self.kept -= 1;
+        if self.past > 0 {
+            // The oldest of those past takes the place freed, untimed as it came.
+            self.times[(self.first + self.kept) % TIMED_MAX] = None;
+            self.kept += 1;
+            self.past -= 1;
+        }
+        time
+    }
+
+    /// The task starts waiting for the engine at `now`, for a free window or for input: until
+    /// [`PieceTimes::wait_ends`], its time is no batch's.
+    pub fn wait_begins(&mut self, now: u64) {
+        self.share(now);
+        self.waiting = true;
+    }
+
+    /// The task's wait for the engine ends at `now`.
+    pub fn wait_ends(&mut self, now: u64) {
+        self.at = self.at.max(now);
+        self.waiting = false;
     }
 }

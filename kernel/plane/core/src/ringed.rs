@@ -280,8 +280,9 @@ struct RingTask<C: RingCalls> {
     mode: Mode,
     generation: u64,
     windows: Vec<Win>,
-    /// Inputs posted and not released, oldest first.
-    inflight: VecDeque<(u64, InEntry)>,
+    /// Inputs posted and not released, oldest first, each with the function time the task gave
+    /// it on its release once the engine has read the release (item 6.3z).
+    inflight: VecDeque<(u64, InEntry, Option<u64>)>,
     /// A wait the task called: its token, what for, and the head it saw.
     wait: Option<(u64, u8, u64)>,
     /// Unmap mode: the rings object is handed back and the next not pushed yet.
@@ -777,7 +778,7 @@ impl<C: RingCalls> RingPlane<C> {
         if !t.engine.post(&*view, entry) {
             return Err(PlaneError::Full);
         }
-        t.inflight.push_back((batch.0, entry));
+        t.inflight.push_back((batch.0, entry, None));
         let owed = t.engine.owed();
         if t.engine.ring_at(&*view, self.group, now) {
             self.counters.bells += 1;
@@ -1146,8 +1147,9 @@ impl<C: RingCalls> RingPlane<C> {
         self.end_if_drained(id)
     }
 
-    /// Reads the inputs the task released since the engine last read; they are given as
-    /// events by [`Self::emit_released`].
+    /// Reads the inputs the task released since the engine last read, and the time the task gave
+    /// each (item 6.3z), before any post can reuse their entries; they are given as events by
+    /// [`Self::emit_released`].
     fn count_released(&mut self, id: u32) -> Result<(), PlaneError> {
         let Some(t) = self.tasks.get(&id) else {
             return Ok(());
@@ -1159,8 +1161,16 @@ impl<C: RingCalls> RingPlane<C> {
             .rings_view(t.rings)
             .ok_or(PlaneError::Unknown("rings"))?;
         let t = self.tasks.get_mut(&id).ok_or(PlaneError::Unknown("task"))?;
+        let from = t.engine.unreleased().start;
         match t.engine.released(&*view) {
             Ok(n) => {
+                // Those released and not yet given lead the inputs in flight; these follow them.
+                for k in 0..n {
+                    let piece_ns = t.engine.piece_ns(&*view, from + k);
+                    if let Some(flight) = t.inflight.get_mut((t.releases + k) as usize) {
+                        flight.2 = piece_ns;
+                    }
+                }
                 t.releases += n;
                 Ok(())
             }
@@ -1183,8 +1193,10 @@ impl<C: RingCalls> RingPlane<C> {
                 return Ok(());
             };
             // An input ahead of the one `cookie` answers, or any, when it answers none in flight.
-            let ahead =
-                t.releases > 0 && t.inflight.front().is_some_and(|(_, e)| e.cookie != cookie);
+            let ahead = t.releases > 0
+                && t.inflight
+                    .front()
+                    .is_some_and(|(_, e, _)| e.cookie != cookie);
             if !ahead {
                 return Ok(());
             }
@@ -1222,7 +1234,9 @@ impl<C: RingCalls> RingPlane<C> {
     }
 
     fn release_one(&mut self, id: u32) -> Result<(), PlaneError> {
-        let Some((batch, _)) = self.tasks.get_mut(&id).and_then(|t| t.inflight.pop_front()) else {
+        let Some((batch, _, piece_ns)) =
+            self.tasks.get_mut(&id).and_then(|t| t.inflight.pop_front())
+        else {
             return Ok(());
         };
         if let Some(b) = self.plane.batches.get_mut(&batch) {
@@ -1232,6 +1246,7 @@ impl<C: RingCalls> RingPlane<C> {
             task: TaskId(id),
             input: 0,
             batch: BatchId(batch),
+            piece_ns,
         });
         self.plane.settle(batch)
     }
@@ -1321,7 +1336,7 @@ impl<C: RingCalls> RingPlane<C> {
         let (object, view, _) = self.object_for(id, bytes)?;
         let t = self.tasks.get_mut(&id).ok_or(PlaneError::Unknown("task"))?;
         let generation = t.generation + 1;
-        let entries: Vec<InEntry> = t.inflight.iter().map(|(_, e)| *e).collect();
+        let entries: Vec<InEntry> = t.inflight.iter().map(|(_, e, _)| *e).collect();
         let engine = t.engine.carry(&view, t.mode, generation, entries);
         let next = self.owner(Owner::Rings(RingsObject {
             object,

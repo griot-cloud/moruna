@@ -375,10 +375,12 @@ impl<C: Calls> KernelPlane<C> {
                         if let Some(b) = self.batches.get_mut(&cookie) {
                             b.shares = b.shares.saturating_sub(1);
                         }
+                        // A task of the slots gives no time on its release.
                         self.events.push_back(Event::Released {
                             task: TaskId(id),
                             input: index as u32,
                             batch: BatchId(cookie),
+                            piece_ns: None,
                         });
                         self.settle(cookie)?;
                     }

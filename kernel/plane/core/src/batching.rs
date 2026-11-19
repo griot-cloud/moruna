@@ -8,6 +8,10 @@
 //! scheduler wakes it. The calls each side makes into the kernel are counted as the booted DS-P
 //! steady counts them: the engine's calls and its futex waits and wakes, and the task's futex
 //! waits (each a linger or a sleep) and its wakes of the engine.
+//!
+//! Item 6.3z: the task measures each piece's function time as `Rings` does ([`PieceTimes`]) and
+//! gives it on its release, and the engine's `Released` carries it; a task or an engine of
+//! before goes on as it did.
 
 extern crate std;
 
@@ -17,7 +21,7 @@ use core::cell::{Cell, RefCell};
 use crate::model::Model;
 use crate::model_ring::{RingTaskModel, model};
 use crate::port::{DataPlane, Event, TaskId};
-use crate::ring::{self, OutEntry, Pace, Rest, Shared, Task, layout};
+use crate::ring::{self, OutEntry, Pace, PieceTimes, Rest, Shared, Task, layout};
 use crate::ringed::{Region, RegionId, RingPlane, RingShape, View};
 
 const US: u64 = 1_000;
@@ -137,6 +141,8 @@ struct Engine {
     /// It reads its clock with no call (rule (d): a sleeping task woken a group of posts at a
     /// time); without one, a sleeping task is woken at each post.
     clock: bool,
+    /// The function time each release gave, in the order the plane gave them (item 6.3z).
+    pieces: Vec<Option<u64>>,
 }
 
 impl Engine {
@@ -180,27 +186,28 @@ impl Engine {
                 self.post_times.push(self.at);
                 self.ops.pop_front();
             }
-            Op::Take => match {
+            Op::Take => {
                 self.tick();
-                self.plane.next(1).expect("next")
-            } {
-                Some(Event::Put { batch, .. }) => {
-                    let posted = self.posted.pop_front().expect("a batch in flight");
-                    self.latency.push(self.at - posted);
-                    self.at += self.costs.judge;
-                    self.plane.drop_batch(batch).expect("the record dropped");
-                    self.ops.pop_front();
+                match self.plane.next(1).expect("next") {
+                    Some(Event::Put { batch, .. }) => {
+                        let posted = self.posted.pop_front().expect("a batch in flight");
+                        self.latency.push(self.at - posted);
+                        self.at += self.costs.judge;
+                        self.plane.drop_batch(batch).expect("the record dropped");
+                        self.ops.pop_front();
+                    }
+                    Some(Event::Ended { .. } | Event::Refused { .. } | Event::Call { .. }) => {
+                        panic!("the task ended or broke the protocol")
+                    }
+                    Some(Event::Released { piece_ns, .. }) => self.pieces.push(piece_ns),
+                    Some(_) => {}
+                    None => {
+                        // Asleep on its bell: the task's next record wakes it.
+                        self.blocked = true;
+                        set_word(&self.rings, layout::ENGINE_WAITS, 1);
+                    }
                 }
-                Some(Event::Ended { .. } | Event::Refused { .. } | Event::Call { .. }) => {
-                    panic!("the task ended or broke the protocol")
-                }
-                Some(_) => {}
-                None => {
-                    // Asleep on its bell: the task's next record wakes it.
-                    self.blocked = true;
-                    set_word(&self.rings, layout::ENGINE_WAITS, 1);
-                }
-            },
+            }
             Op::Busy(d) => {
                 self.at += d;
                 self.ops.pop_front();
@@ -213,10 +220,14 @@ impl Engine {
             Op::Poll => {
                 self.tick();
                 while let Some(e) = self.plane.next(0).expect("a poll") {
-                    if let Event::Put { batch, .. } = e {
-                        let posted = self.posted.pop_front().expect("a batch in flight");
-                        self.latency.push(self.at - posted);
-                        self.plane.drop_batch(batch).expect("the record dropped");
+                    match e {
+                        Event::Put { batch, .. } => {
+                            let posted = self.posted.pop_front().expect("a batch in flight");
+                            self.latency.push(self.at - posted);
+                            self.plane.drop_batch(batch).expect("the record dropped");
+                        }
+                        Event::Released { piece_ns, .. } => self.pieces.push(piece_ns),
+                        _ => {}
                     }
                 }
                 self.ops.pop_front();
@@ -414,6 +425,19 @@ fn measure_d(ops: &[Op], costs: Costs, cpus: Cpus, waits: Waits) -> Measured {
 
 /// [`measure`], the engine and the task kept; `clock`, whether the engine reads its clock.
 fn run(ops: &[Op], costs: Costs, cpus: Cpus, waits: Waits, group: u64, clock: bool) -> Run {
+    run_in(ops, costs, cpus, waits, group, clock, 40)
+}
+
+/// [`run`] with a task of `windows` windows.
+fn run_in(
+    ops: &[Op],
+    costs: Costs,
+    cpus: Cpus,
+    waits: Waits,
+    group: u64,
+    clock: bool,
+    windows: u64,
+) -> Run {
     let posts = ops.iter().filter(|o| **o == Op::Post).count() as u64;
     let mut plane = RingPlane::new(model(true), 64 << 20);
     plane.spins = 1;
@@ -421,7 +445,7 @@ fn run(ops: &[Op], costs: Costs, cpus: Cpus, waits: Waits, group: u64, clock: bo
     let (task, _port) = plane
         .open_ring(RingShape {
             region: Region::New(64 * WINDOW),
-            windows: 40,
+            windows,
             window_bytes: WINDOW,
         })
         .expect("a ring task");
@@ -445,6 +469,7 @@ fn run(ops: &[Op], costs: Costs, cpus: Cpus, waits: Waits, group: u64, clock: bo
         post_times: Vec::new(),
         latency: Vec::new(),
         clock,
+        pieces: Vec::new(),
     }));
     let map = TaskMap {
         bytes: rings,
@@ -493,10 +518,14 @@ struct TaskRun {
     answered: Vec<u64>,
     /// Its time spent spinning.
     spun: u64,
+    /// For each batch, its time from its take to its release, window waits and all.
+    held: Vec<u64>,
 }
 
 /// The task: answers each batch with its record in a window, and waits for input as `waits`
-/// says.
+/// says. It measures each piece's function time as `moruna_sys::plane::Rings` does
+/// ([`PieceTimes`]: its take to its release, less its waits for a window) and gives it on its
+/// release.
 fn run_task(
     engine: &Rc<RefCell<Engine>>,
     map: &TaskMap,
@@ -507,22 +536,28 @@ fn run_task(
     let mut half = Task::attach(map).expect("attached");
     let clock = map.at.clone();
     let mut pace = Pace::new(half.head(map), clock.get());
+    let mut pieces = PieceTimes::new(clock.get());
     let mut calls = 0u64;
     let mut answered = Vec::new();
+    let mut held = Vec::new();
     let mut spun = 0;
     loop {
         engine.borrow_mut().catch_up(clock.get());
         match half.next(map).expect("an input") {
             Some(e) => {
+                let took = clock.get();
+                pieces.took(took);
                 clock.set(clock.get() + compute);
                 engine.borrow_mut().catch_up(clock.get());
                 let w = loop {
                     if let Some(w) = half.window(map).expect("a window") {
                         break w;
                     }
+                    pieces.wait_begins(clock.get());
                     let slept = half.rest(map, Rest::Sleep(FOREVER), |t| t.has_window(map));
                     calls += u64::from(slept.called());
                     engine.borrow_mut().catch_up(clock.get());
+                    pieces.wait_ends(clock.get());
                 };
                 let bytes =
                     region.borrow()[e.offset as usize..(e.offset + e.len) as usize].to_vec();
@@ -537,9 +572,10 @@ fn run_task(
                         cookie: e.cookie,
                     }
                 ));
-                half.release(map);
+                half.release_timed(map, pieces.released(clock.get()));
                 calls += u64::from(half.ring(map));
                 answered.push(clock.get());
+                held.push(clock.get() - took);
             }
             None if half.ended(map) => {
                 calls += u64::from(half.exit(map, 0));
@@ -547,6 +583,7 @@ fn run_task(
                     calls,
                     answered,
                     spun,
+                    held,
                 };
             }
             None => {
@@ -556,6 +593,8 @@ fn run_task(
                             .called(),
                     )
                 };
+                // A wait for input is the engine's time, as `Rings::wait_input` counts it.
+                pieces.wait_begins(clock.get());
                 calls += u64::from(match waits {
                     // The rule as the task on the kernel runs it.
                     Waits::Lingers(ring::GROUP) => {
@@ -591,6 +630,7 @@ fn run_task(
                         n
                     }
                 });
+                pieces.wait_ends(clock.get());
             }
         }
     }
@@ -1276,4 +1316,320 @@ fn measures_the_candidate_rules() {
             }
         }
     }
+}
+
+/// Item 6.3z: a release carries the piece's function time, its take to its release less its
+/// waits for a window. A task of two windows answering faster than its engine takes its records
+/// waits for windows while it holds a batch (DS-P steady's program: 32 posts, then 32 takes): each
+/// release still gives the function's own time, the batch's compute, and none of the waits.
+#[test]
+fn a_release_carries_its_piece_s_time_less_its_waits_for_a_window() {
+    for cpus in [Cpus::Each, Cpus::One] {
+        let r = run_in(&steady(2), FAST_TASK, cpus, LINGERS, ring::GROUP, false, 2);
+        let mut e = r.engine.borrow_mut();
+        // The last release follows the last record, which the program's last take took.
+        while let Some(ev) = e.plane.next(0).expect("a poll") {
+            if let Event::Released { piece_ns, .. } = ev {
+                e.pieces.push(piece_ns);
+            }
+        }
+        assert_eq!(e.pieces.len(), 64, "{cpus:?}: a release a batch");
+        assert!(
+            e.pieces.iter().all(|p| *p == Some(FAST_TASK.compute)),
+            "{cpus:?}: every piece's time is its compute: {:?}",
+            e.pieces
+        );
+        let waited = r
+            .task
+            .held
+            .iter()
+            .filter(|h| **h > FAST_TASK.compute)
+            .count();
+        assert!(
+            waited > 0,
+            "{cpus:?}: some batch was held through a wait for a window: {:?}",
+            r.task.held
+        );
+    }
+}
+
+/// A rings object's words, as a task maps them.
+struct Plain(Rc<RefCell<Vec<u8>>>);
+
+impl Shared for Plain {
+    fn load(&self, at: usize) -> u64 {
+        word(&self.0, at)
+    }
+    fn store(&self, at: usize, value: u64) {
+        set_word(&self.0, at, value);
+    }
+    fn fence(&self) {}
+}
+
+/// One batch posted to a ring task that `attach` attaches, answered with its record, and
+/// released by `release`: the time the plane's `Released` gives, and the entry's word the task
+/// left at [`layout::IN_PIECE_NS`].
+fn one_release(
+    attach: impl FnOnce(&Plain) -> Task,
+    release: impl FnOnce(&mut Task, &Plain),
+) -> (Option<u64>, u64) {
+    let mut p = RingPlane::new(model(true), 64 << 20);
+    p.spins = 1;
+    let (task, _port) = p
+        .open_ring(RingShape {
+            region: Region::New(1 << 20),
+            windows: 2,
+            window_bytes: WINDOW,
+        })
+        .expect("a ring task");
+    let [input, output] = p.ring_slots(task).expect("its slots");
+    let region = RingTaskModel::map(input).expect("the region").bytes;
+    let map = Plain(RingTaskModel::map(output).expect("the rings object").bytes);
+    let mut half = attach(&map);
+    let record = crate::tests::record();
+    let at_region = p.region_of(task).expect("its region");
+    let (b, _) = p
+        .load_into(at_region, record.len() as u64, |v, at| v.write(at, &record))
+        .expect("laid out");
+    p.offer(task, 0, b).expect("posted");
+    p.drop_batch(b).expect("the engine's hold");
+    let e = half.next(&map).expect("an input").expect("the batch");
+    let w = half.window(&map).expect("a window").expect("given");
+    let bytes = region.borrow()[e.offset as usize..(e.offset + e.len) as usize].to_vec();
+    let at = half.geometry.window_at(w) as usize;
+    map.0.borrow_mut()[at..at + bytes.len()].copy_from_slice(&bytes);
+    assert!(half.post(
+        &map,
+        OutEntry {
+            window: w,
+            offset: 0,
+            len: e.len,
+            cookie: e.cookie,
+        }
+    ));
+    let word = half.geometry.in_entries() + layout::IN_PIECE_NS;
+    release(&mut half, &map);
+    let mut given = Vec::new();
+    while let Some(ev) = p.next(0).expect("next") {
+        if let Event::Released { piece_ns, .. } = ev {
+            given.push(piece_ns);
+        }
+    }
+    assert_eq!(given.len(), 1, "one release");
+    (given[0], map.load(word))
+}
+
+/// A task of this protocol attaches at [`layout::ATTACHED_TIMED`], and the engine gives its
+/// release's time; a release it gave no time is untimed. The header's version is still 4, so a
+/// task of before attaches as it did.
+#[test]
+fn a_new_task_s_release_gives_its_piece_s_time() {
+    let (timed, word) = one_release(
+        |m| Task::attach(m).expect("attached"),
+        |t, m| assert!(t.release_timed(m, Some(1_234))),
+    );
+    assert_eq!((timed, word), (Some(1_234), 1_234));
+    let (untimed, word) = one_release(
+        |m| {
+            let t = Task::attach(m).expect("attached");
+            assert_eq!(m.load(layout::ATTACHED), layout::ATTACHED_TIMED);
+            assert_eq!(m.load(layout::VERSION), 4, "the layout's version stands");
+            t
+        },
+        |t, m| assert!(t.release(m)),
+    );
+    assert_eq!((untimed, word), (None, layout::NO_TIME));
+}
+
+/// A task of before (the Python shim's) attaches at 4 and stores its release alone, leaving the
+/// entry's `rows` word as the engine wrote it: the engine gives no time, and reads none from a
+/// task attached at 4 whatever the word holds.
+#[test]
+fn an_old_task_s_release_gives_no_time() {
+    let attach_4 = |m: &Plain| {
+        let t = Task::attach(m).expect("attached");
+        m.store(layout::ATTACHED, layout::VERSION_VALUE);
+        t
+    };
+    // Protocol 4's release: the tail, and nothing else.
+    let (old, word) = one_release(attach_4, |_, m| m.store(layout::IN_TAIL, 1));
+    assert_eq!(old, None);
+    assert_ne!(word, layout::NO_TIME, "the word is the engine's `rows`");
+    let (old, word) = one_release(attach_4, |t, m| assert!(t.release_timed(m, Some(77))));
+    assert_eq!(
+        (old, word),
+        (None, 77),
+        "a time from a task attached at 4 is not read"
+    );
+}
+
+/// An engine of before reads no entry back: a new task's stamped releases change nothing it does,
+/// and the entry's next post over the slot is read as the engine wrote it. The new engine reads a
+/// time once the release has passed the entry and until it posts over it; never before, never
+/// after, never [`layout::NO_TIME`], and a time past it is given as the largest it can say.
+#[test]
+fn an_old_engine_ignores_the_time_a_new_task_writes() {
+    let s = Words::new();
+    let g = ring::Geometry::read(&s).expect("header").0;
+    let mut e = ring::Engine::format(&s, g, ring::Mode::Protect, 0);
+    let mut t = task(&s);
+    assert_eq!(e.piece_ns(&s, 0), None, "nothing released");
+    let laps = 2 * g.in_cap + 1;
+    for i in 0..laps {
+        let entry = ring::InEntry {
+            offset: 0,
+            len: 4096,
+            cookie: i + 1,
+            rows: 1_000 + i,
+        };
+        // Protocol 4's engine: a post, and the release counted.
+        assert!(e.post(&s, entry), "post {i}");
+        assert_eq!(
+            t.next(&s).expect("an input"),
+            Some(entry),
+            "post {i}: as the engine wrote it, not a time left in its slot"
+        );
+        assert_eq!(e.piece_ns(&s, i), None, "taken, not released");
+        assert!(t.release_timed(&s, Some(i * 10)));
+        assert_eq!(e.released(&s), Ok(1));
+        assert_eq!(e.piece_ns(&s, i), Some(i * 10), "the new engine's read");
+    }
+    // An entry posted over is no longer the release's.
+    let last = laps - 1;
+    assert!(e.post(
+        &s,
+        ring::InEntry {
+            offset: 0,
+            len: 4096,
+            cookie: 0,
+            rows: 0
+        }
+    ));
+    assert_eq!(e.piece_ns(&s, last + 1 - g.in_cap), None, "posted over");
+    assert_eq!(
+        e.piece_ns(&s, last + 2 - g.in_cap),
+        Some((last + 2 - g.in_cap) * 10)
+    );
+    t.next(&s).expect("an input").expect("posted");
+    assert!(t.release(&s));
+    assert!(!t.release_timed(&s, Some(1)), "nothing held");
+    assert_eq!(e.released(&s), Ok(1));
+    // A time past what the word can say, and none at all.
+    for (given, read) in [(Some(u64::MAX), Some(layout::NO_TIME - 1)), (None, None)] {
+        let entry = ring::InEntry {
+            offset: 0,
+            len: 4096,
+            cookie: 0,
+            rows: 0,
+        };
+        assert!(e.post(&s, entry));
+        t.next(&s).expect("an input").expect("posted");
+        assert_eq!(t.held(), 1);
+        assert!(t.release_timed(&s, given));
+        assert_eq!(e.released(&s), Ok(1));
+        assert_eq!(e.piece_ns(&s, e.unreleased().start - 1), read);
+    }
+}
+
+/// The task's busy time is shared among the batches it holds: two batches held at once are each
+/// given their share between events, a wait for a window adds to neither, and their times sum
+/// to the time the task was busy holding them, never its waiting.
+#[test]
+fn two_batches_held_at_once_share_the_task_s_time_and_a_window_wait_is_neither_s() {
+    let mut p = PieceTimes::new(1_000);
+    assert_eq!(p.released(1_000), None, "no batch held");
+    p.took(1_000); // A
+    p.took(1_100); // B: A had 100 alone
+    p.wait_begins(1_300); // each 100 more
+    p.wait_ends(2_000); // the wait: neither's
+    let a = p.released(2_101); // 101 shared: 51 to A, the oldest, 50 to B
+    assert_eq!(a, Some(100 + 100 + 51));
+    assert_eq!(p.held(), 1);
+    let b = p.released(2_301); // B alone
+    assert_eq!(b, Some(100 + 50 + 200));
+    assert_eq!(
+        a.unwrap_or(0) + b.unwrap_or(0),
+        (1_300 - 1_000) + (2_301 - 2_000),
+        "their times sum to the time the task was busy"
+    );
+    // A clock read out of turn takes nothing back.
+    p.took(3_000);
+    assert_eq!(p.released(2_900), Some(0));
+    assert_eq!(p.held(), 0);
+}
+
+/// A task that holds a batch while it waits for its next input (`moruna-function`'s `Task` keeps
+/// a batch until every part of it is dropped) gives the wait to no batch: it is the engine's time,
+/// as a wait for a window is.
+#[test]
+fn a_batch_held_across_a_wait_for_input_is_not_given_the_wait() {
+    let mut p = PieceTimes::new(0);
+    p.took(0); // A, worked on until 100
+    p.wait_begins(100); // no input yet: `Rings::wait_input`, A still held
+    p.wait_ends(900);
+    p.took(900); // B
+    let a = p.released(1_000); // 100 shared between A and B
+    assert_eq!(a, Some(100 + 50));
+    let b = p.released(1_100);
+    assert_eq!(b, Some(50 + 100));
+    assert_eq!(
+        a.unwrap_or(0) + b.unwrap_or(0),
+        100 + (1_100 - 900),
+        "the batches' times are the task's busy time, never its wait"
+    );
+    // The same wait through the task's own half, as the simulation's task runs it: a batch
+    // held, no input, a sleep the engine's next post ends.
+    let s = Words::new();
+    let g = ring::Geometry::read(&s).expect("header").0;
+    let mut e = ring::Engine::format(&s, g, ring::Mode::Protect, 0);
+    let mut t = task(&s);
+    let entry = |cookie| ring::InEntry {
+        offset: 0,
+        len: 4096,
+        cookie,
+        rows: 1,
+    };
+    let mut pieces = PieceTimes::new(0);
+    assert!(e.post(&s, entry(1)));
+    t.next(&s).expect("an input").expect("posted");
+    pieces.took(0);
+    assert_eq!(t.next(&s).expect("an input"), None, "nothing more yet");
+    pieces.wait_begins(40);
+    let mut pace = Pace::new(t.head(&s), 40);
+    // `Words` has no futex: the wait returns at once, as a wake would; the clock moves past it.
+    t.wait_input(&s, &mut pace, || 40, FOREVER);
+    pieces.wait_ends(5_040);
+    assert!(e.post(&s, entry(2)));
+    t.next(&s).expect("an input").expect("posted");
+    pieces.took(5_040);
+    assert!(t.release_timed(&s, pieces.released(5_100)));
+    assert_eq!(e.released(&s), Ok(1));
+    assert_eq!(
+        e.piece_ns(&s, 0),
+        Some(40 + 30),
+        "its work before the wait, and its share after"
+    );
+}
+
+/// The task times [`ring::TIMED_MAX`] batches held at once: one taken past them goes untimed, as
+/// does each taken while one untimed is still held behind them.
+#[test]
+fn a_batch_held_past_the_timed_ones_goes_untimed() {
+    let mut p = PieceTimes::new(0);
+    for k in 0..=ring::TIMED_MAX as u64 {
+        p.took(k);
+    }
+    assert_eq!(p.held(), ring::TIMED_MAX as u64 + 1);
+    assert!(p.released(1_000).is_some(), "the oldest was timed");
+    p.took(1_001);
+    let rest: Vec<Option<u64>> = (0..ring::TIMED_MAX as u64 + 1)
+        .map(|k| p.released(2_000 + k))
+        .collect();
+    assert!(rest[..ring::TIMED_MAX - 1].iter().all(Option::is_some));
+    assert_eq!(
+        &rest[ring::TIMED_MAX - 1..],
+        &[None, None],
+        "the two taken past them"
+    );
+    assert_eq!(p.held(), 0);
 }

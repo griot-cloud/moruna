@@ -11,7 +11,10 @@
 //! Its tasks are threads, as `images/gate/tasks` runs on `moruna_sys::plane::Rings`: a region of
 //! `IN_FLIGHT + 1` pieces and `WINDOWS` windows; each batch answered in turn with its records,
 //! each in a window, then released; asleep on the task's bell while it has no batch or no
-//! window (`Rings::wait_input`, `Rings::wait_window`), never waiting on its port. The plane is
+//! window (`Rings::wait_input`, `Rings::wait_window`), never waiting on its port. Each release
+//! carries the piece's function time as `Rings` measures it (item 6.3z,
+//! `moruna_plane::ring::PieceTimes`: its take to its release, less its waits for a window), and
+//! the stage gives it to the piece's morsel as `task.rs` does. The plane is
 //! `moruna_plane::RingPlane` as the stage meets it: a record the stage keeps in place holds its
 //! window until downstream drops the last buffer over it and the stage reaps it; a landed one is
 //! dropped once it has landed; a dropped record's window is idle, and idle windows go back to the
@@ -66,7 +69,8 @@ fn kernel_error(msg: &str) -> MorunaError {
 /// What a task says on its rings.
 enum Ev {
     Put(u64),
-    Released(u64),
+    /// A batch released, with the function time the task gave it (item 6.3z).
+    Released(u64, Option<u64>),
     Ended,
 }
 
@@ -174,6 +178,9 @@ impl Plane {
     /// The task (`images/gate/tasks`): each batch in turn, answered with `parts` records, each
     /// in a window, then released; asleep on its bell when it has no batch or no window.
     fn task(&self, work: Duration, parts: usize) {
+        let start = std::time::Instant::now();
+        let now = || start.elapsed().as_nanos() as u64;
+        let mut pieces = moruna_plane::ring::PieceTimes::new(now());
         loop {
             let (id, batch) = {
                 let mut w = lock(&self.wire);
@@ -183,6 +190,7 @@ impl Plane {
                     }
                     if let Some(next) = w.input.pop_front() {
                         w.holding += 1;
+                        pieces.took(now());
                         break next;
                     }
                     if w.closed {
@@ -190,10 +198,13 @@ impl Plane {
                         self.bell.notify_all();
                         return;
                     }
+                    // A wait for input is the engine's time (`Rings::wait_input`).
+                    pieces.wait_begins(now());
                     w = self
                         .bell
                         .wait(w)
                         .unwrap_or_else(std::sync::PoisonError::into_inner);
+                    pieces.wait_ends(now());
                 }
             };
             std::thread::sleep(work);
@@ -203,6 +214,9 @@ impl Plane {
             for at in (0..rows.max(1)).step_by(each) {
                 let answer = heap_copy(&batch.slice(at.min(rows), each.min(rows - at.min(rows))));
                 let mut w = lock(&self.wire);
+                if w.given == 0 {
+                    pieces.wait_begins(now());
+                }
                 while w.given == 0 {
                     if w.stop {
                         return;
@@ -212,6 +226,9 @@ impl Plane {
                         .bell
                         .wait(w)
                         .unwrap_or_else(std::sync::PoisonError::into_inner);
+                }
+                if w.no_window {
+                    pieces.wait_ends(now());
                 }
                 w.no_window = false;
                 w.given -= 1;
@@ -223,7 +240,7 @@ impl Plane {
             }
             let mut w = lock(&self.wire);
             w.holding -= 1;
-            w.events.push_back(Ev::Released(id));
+            w.events.push_back(Ev::Released(id, pieces.released(now())));
             self.bell.notify_all();
         }
     }
@@ -332,7 +349,7 @@ impl Faults {
 
 enum Seen {
     Put(u64),
-    Released(u64),
+    Released(u64, Option<u64>),
     Ended,
 }
 
@@ -350,12 +367,13 @@ struct EngineLook {
     ready: usize,
 }
 
-/// `task.rs`'s `Taking`: an answer being taken.
+/// `task.rs`'s `Taking`: an answer being taken, and the time its release gave.
 struct Taking {
     offered: u64,
     parts: Vec<Payload>,
     refused: Option<u64>,
     released: bool,
+    piece_ns: Option<u64>,
 }
 
 /// `TaskState` in ring mode.
@@ -376,8 +394,6 @@ struct Ring {
     /// The morsels given and not answered in full, and those answered whole and not given (6.3m).
     morsels: layout::Morsels<Payload>,
     done: VecDeque<layout::Answered<Payload>>,
-    /// What the function takes a piece, which the model's task reports as its time.
-    work: Duration,
     taking: Option<Taking>,
     early: VecDeque<Seen>,
     schema: Option<SchemaRef>,
@@ -476,11 +492,11 @@ impl Ring {
                     "it put a record before it was offered a batch",
                 ))
             }
-            Some(Ev::Released(b)) if !self.in_flight.is_empty() || self.taking.is_some() => {
-                self.early.push_back(Seen::Released(b));
+            Some(Ev::Released(b, ns)) if !self.in_flight.is_empty() || self.taking.is_some() => {
+                self.early.push_back(Seen::Released(b, ns));
                 Ok(true)
             }
-            Some(Ev::Released(_)) => Ok(true),
+            Some(Ev::Released(..)) => Ok(true),
             Some(Ev::Ended) => Err(kernel_error("it ended while the engine offered a batch")),
         }
     }
@@ -516,7 +532,7 @@ impl Ring {
             self.reap();
             match self.plane.next(LOOK) {
                 Some(Ev::Put(r)) => return Ok(Seen::Put(r)),
-                Some(Ev::Released(b)) => return Ok(Seen::Released(b)),
+                Some(Ev::Released(b, ns)) => return Ok(Seen::Released(b, ns)),
                 Some(Ev::Ended) => return Ok(Seen::Ended),
                 None => {
                     if self.stop.load(Ordering::SeqCst) {
@@ -534,8 +550,11 @@ impl Ring {
         while !t.released {
             match self.wait_any()? {
                 Seen::Put(out) => self.part(t, out)?,
-                Seen::Released(b) if b == t.offered => t.released = true,
-                Seen::Released(_) => {}
+                Seen::Released(b, ns) if b == t.offered => {
+                    t.released = true;
+                    t.piece_ns = ns;
+                }
+                Seen::Released(..) => {}
                 Seen::Ended => return Err(kernel_error("it ended before it answered")),
             }
         }
@@ -581,13 +600,13 @@ impl Ring {
             self.whole = layout::answers_whole(self.schema.is_some());
         }
         if self.taking.is_some() {
-            let answer = self.take_oldest()?;
-            self.took(answer)?;
+            let (answer, ns) = self.take_oldest()?;
+            self.took(answer, ns)?;
         }
         self.feed()?;
         if self.schema.is_none() {
-            let answer = self.take_oldest()?;
-            self.took(answer)?;
+            let (answer, ns) = self.take_oldest()?;
+            self.took(answer, ns)?;
             self.feed()?;
         }
         loop {
@@ -597,16 +616,16 @@ impl Ring {
                 && self
                     .early
                     .iter()
-                    .any(|seen| matches!(seen, Seen::Released(b) if *b == oldest))
+                    .any(|seen| matches!(seen, Seen::Released(b, _) if *b == oldest))
             {
-                let answer = self.take_oldest()?;
-                self.took(answer)?;
+                let (answer, ns) = self.take_oldest()?;
+                self.took(answer, ns)?;
                 came = true;
             }
             self.feed()?;
             if layout::waits_for_answer(self.queued.len(), self.in_flight.len(), self.whole) {
-                let answer = self.take_oldest()?;
-                self.took(answer)?;
+                let (answer, ns) = self.take_oldest()?;
+                self.took(answer, ns)?;
                 self.feed()?;
             } else if !came {
                 break;
@@ -618,13 +637,12 @@ impl Ring {
         Ok(given)
     }
 
-    /// `TaskState::took`: an answer to its morsel. The model's task reports each piece's
-    /// function time, its `work`, as a task that stamps it on its release would (item 6.3z).
-    fn took(&mut self, answer: Payload) -> Result<()> {
-        let ns = self.work.as_nanos() as u64;
+    /// `TaskState::took`: an answer to its morsel, with the piece's function time its release
+    /// gave (item 6.3z), its wall and CPU time alike.
+    fn took(&mut self, answer: Payload, piece_ns: Option<u64>) -> Result<()> {
         if let Some(whole) = self
             .morsels
-            .answer(answer, Some((ns, ns)))
+            .answer(answer, piece_ns.map(|ns| (ns, ns)))
             .map_err(kernel_error)?
         {
             self.done.push_back(whole);
@@ -683,7 +701,7 @@ impl Ring {
         Ok(())
     }
 
-    fn take_oldest(&mut self) -> Result<Payload> {
+    fn take_oldest(&mut self) -> Result<(Payload, Option<u64>)> {
         let mut taking = match self.taking.take() {
             Some(taking) => taking,
             None => Taking {
@@ -694,6 +712,7 @@ impl Ring {
                 parts: Vec::new(),
                 refused: None,
                 released: false,
+                piece_ns: None,
             },
         };
         let answer = match self.answers(&mut taking) {
@@ -708,14 +727,14 @@ impl Ring {
             lock(&self.stage_schema).get_or_insert_with(|| Arc::clone(&schema));
             self.schema = Some(schema);
         }
-        Ok(answer)
+        Ok((answer, taking.piece_ns))
     }
 
     fn gather(&mut self) {
         while let Some(event) = self.plane.next(Duration::ZERO) {
             match event {
                 Ev::Put(r) => self.early.push_back(Seen::Put(r)),
-                Ev::Released(b) => self.early.push_back(Seen::Released(b)),
+                Ev::Released(b, ns) => self.early.push_back(Seen::Released(b, ns)),
                 Ev::Ended => {
                     self.early.push_back(Seen::Ended);
                     return;
@@ -863,7 +882,6 @@ impl Kernel for NativeStage {
             whole: false,
             morsels: layout::Morsels::new(),
             done: VecDeque::new(),
-            work: self.work,
             taking: None,
             early: VecDeque::new(),
             schema: None,
@@ -910,14 +928,14 @@ impl Kernel for NativeStage {
             if st.in_flight.is_empty() && st.taking.is_none() {
                 break;
             }
-            let answer = st.take_oldest()?;
-            st.took(answer)?;
+            let (answer, ns) = st.take_oldest()?;
+            st.took(answer, ns)?;
         }
         let rest = st.give()?;
         st.plane.finish();
         loop {
             match st.wait_any()? {
-                Seen::Released(_) => {}
+                Seen::Released(..) => {}
                 Seen::Put(_) => return Err(kernel_error("a record after the last batch")),
                 Seen::Ended => return Ok(rest),
             }

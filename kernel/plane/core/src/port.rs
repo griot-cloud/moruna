@@ -47,11 +47,15 @@ pub enum Event {
         rows: u64,
         bytes: u64,
     },
-    /// The task is done with its share of `batch` on input `input`.
+    /// The task is done with its share of `batch` on input `input`. `piece_ns` is the function
+    /// time it spent on the batch, in nanoseconds, as it measured it and gave it on its release
+    /// (item 6.3z: a ring task attached at `ring::layout::ATTACHED_TIMED`); `None` from any
+    /// other task, which gives none.
     Released {
         task: TaskId,
         input: u32,
         batch: BatchId,
+        piece_ns: Option<u64>,
     },
     /// `batch` has no holder left and its memory is back in the arena: what the
     /// scheduler's buffer catalog drops (adaptive-runtime 9.2, release).

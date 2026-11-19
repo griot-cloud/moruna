@@ -272,10 +272,12 @@ impl LinuxPlane {
         if let Some(b) = self.batches.get_mut(&batch) {
             b.shares = b.shares.saturating_sub(1);
         }
+        // A Linux task's library gives no time on its release yet (item 6.3z).
         self.events.push_back(Event::Released {
             task: TaskId(task),
             input: input as u32,
             batch: BatchId(batch),
+            piece_ns: None,
         });
         self.settle(batch)
     }
