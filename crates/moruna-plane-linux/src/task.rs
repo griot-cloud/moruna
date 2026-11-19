@@ -35,6 +35,8 @@ pub const SYSCALLS: &[&str] = &[
     "sendmsg",
     "recvmsg",
     "mmap",
+    // A window's mapping is kept from a forked child (`MADV_DONTFORK`, item 6.3f).
+    "madvise",
     "munmap",
     "close",
     "ppoll",

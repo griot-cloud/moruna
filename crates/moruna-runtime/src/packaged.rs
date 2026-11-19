@@ -204,6 +204,27 @@ impl Packaged {
         }
     }
 
+    /// What the run funds a Linux image stage's instances from (system design 3A, 3E; 6.3f):
+    /// its room past the arena. A function whose memory is measured (`line`) has each instance
+    /// funded at its line at the `least` morsel and its batches held to what an instance's
+    /// share holds by the line; an unmeasured one, each instance at the largest batch the run
+    /// may give it (`morsel`) times its `factor`, and its batches at the share over that
+    /// factor. Every other stage is as it is.
+    pub fn bind_room(
+        &self,
+        room: u64,
+        morsel: u64,
+        least: u64,
+        factor: f64,
+        line: Option<&moruna_cost::Memory>,
+    ) {
+        #[cfg(target_os = "linux")]
+        if let Packaged::Image(k) = self {
+            k.bind_room(room, morsel, least, factor, line.cloned());
+        }
+        let _ = (room, morsel, least, factor, line);
+    }
+
     /// The limits moved (MH 4.4): a `.pex` sends its stage ceiling now.
     pub fn limits_changed(&self) {
         match self {
@@ -239,28 +260,36 @@ impl Packaged {
     }
 
     /// The stage warms up on its first task before its others start (system design 3A): the
-    /// node has no readings of its function. `client` is what its registration measured, whose
-    /// slope the fit keeps; `freed` is told the room the others did not need. Whether it
-    /// does: a stage of the data plane's tasks only.
-    #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+    /// run has no measurement of its function resting on enough units (on the node, no readings
+    /// of its own). `client` is what it has, whose slope the fit keeps; `freed` is told the room
+    /// the others did not need. Whether it does: a stage of the data plane's tasks, or a Linux
+    /// image stage (6.3f), which warms up only when it has more than one instance to size.
+    #[cfg(target_os = "linux")]
     pub(crate) fn warm_up(
         &self,
         client: Option<&moruna_cost::Memory>,
         freed: Box<dyn Fn(u64) + Send + Sync>,
     ) -> bool {
-        let Packaged::Task(k) = self else {
-            return false;
-        };
-        k.on_sized(freed);
-        k.warm_up(client.map(|m| moruna_micro::layout::Line {
-            fixed_bytes: m.fixed_bytes,
-            per_input_byte: m.per_input_byte,
-            spread: m.spread,
-            units: m.units,
-            input_bytes_min: m.input_bytes_min,
-            input_bytes_max: m.input_bytes_max,
-        }));
-        true
+        match self {
+            #[cfg(target_arch = "x86_64")]
+            Packaged::Task(k) => {
+                k.on_sized(freed);
+                k.warm_up(client.map(|m| moruna_micro::layout::Line {
+                    fixed_bytes: m.fixed_bytes,
+                    per_input_byte: m.per_input_byte,
+                    spread: m.spread,
+                    units: m.units,
+                    input_bytes_min: m.input_bytes_min,
+                    input_bytes_max: m.input_bytes_max,
+                }));
+                true
+            }
+            Packaged::Image(k) => {
+                k.warm_up(client.cloned(), freed);
+                true
+            }
+            _ => false,
+        }
     }
 
     /// What each instance of the stage's tasks held (system design 3A): its account's peak and
@@ -281,6 +310,9 @@ impl Packaged {
         match self {
             #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
             Packaged::Task(k) => k.note(),
+            // 6.3f: a Linux image stage's instances, and the most that held a batch at once.
+            #[cfg(target_os = "linux")]
+            Packaged::Image(k) => Some(k.note()),
             _ => None,
         }
     }
@@ -478,6 +510,8 @@ mod tests {
         assert_eq!(packaged.kind(), "wasm");
         assert!(packaged.outside().is_none());
         packaged.limits_changed();
+        // A package funds no instances from a room: nothing to say to it.
+        packaged.bind_room(1 << 30, 512 << 20, 4 << 20, 4.0, None);
         packaged.bind_here().unwrap();
         // A .pex with no sandbox host: refused naming what is missing (or, off Linux, Linux).
         let pex = dir.join("x.pex");

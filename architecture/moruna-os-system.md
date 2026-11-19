@@ -762,7 +762,13 @@ Added to `moruna-api` (2A), so the OpenAPI document, the MCP tools and the clien
   a job that ran before:** each instance is funded with an equal share of what the run has past its
   arena, at least a function's least, so the run starts as many as that funds, at least one a
   stage, and is refused only when one does not fit; the report says `N of M instances: the share
-  funds N` (PM, 2026-11-18). One rule for every engine, `moruna_adapters::instances`.
+  funds N` (PM, 2026-11-18). One rule for every engine, `moruna_adapters::instances`. **Each
+  instance is told its share of the job's CPUs,** the whole CPUs it has to itself and at least one
+  (`MORUNA_CPUS`), and the common thread pools (`OMP_NUM_THREADS`, `OPENBLAS_NUM_THREADS`,
+  `MKL_NUM_THREADS`, `NUMEXPR_NUM_THREADS`, `RAYON_NUM_THREADS`) are set to it unless the image's
+  environment sets them, as Dask, Ray and Spark size a worker's: the OS sizes them, not each
+  function (6.3f, found by the Linux Score table: four NumPy processes each threaded across every
+  CPU).
 - **AWS's own S3** (no endpoint) is reached with path-style requests, so its host is
   `s3.<region>.amazonaws.com`, known without the bucket; the region is required.
 

@@ -94,6 +94,11 @@ fn layout(scratch: &Scratch) -> PathBuf {
 }
 
 fn write_parquet(path: &Path, rows: i64) {
+    write_parquet_in(path, rows, 4);
+}
+
+/// `rows` rows in `groups` row groups: a batch for each, at the least.
+fn write_parquet_in(path: &Path, rows: i64, groups: usize) {
     let schema = Arc::new(Schema::new(vec![
         Field::new("id", DataType::Int64, false),
         Field::new("value", DataType::Int64, false),
@@ -106,7 +111,7 @@ fn write_parquet(path: &Path, rows: i64) {
     )
     .expect("a batch");
     let props = parquet::file::properties::WriterProperties::builder()
-        .set_max_row_group_row_count(Some((rows as usize).div_ceil(4)))
+        .set_max_row_group_row_count(Some((rows as usize).div_ceil(groups)))
         .build();
     let mut writer = ArrowWriter::try_new(
         std::fs::File::create(path).expect("the input file"),
@@ -137,6 +142,13 @@ fn image_of(layout: &Path) -> Value {
 fn document(scratch: &Path, layout: &Path, settings: Value) -> JobSpec {
     let input = scratch.join("in.parquet");
     write_parquet(&input, ROWS);
+    job_of(scratch, layout, settings, Some(2.0))
+}
+
+/// The document over `in.parquet`, as written before: the image stage with `settings`, in a
+/// job whose `budget.cpu` is `cpu`, or that names none.
+fn job_of(scratch: &Path, layout: &Path, settings: Value, cpu: Option<f64>) -> JobSpec {
+    let input = scratch.join("in.parquet");
     let out = scratch.join("out");
     std::fs::create_dir_all(&out).unwrap();
     let staging = scratch.join("staging");
@@ -146,12 +158,16 @@ fn document(scratch: &Path, layout: &Path, settings: Value) -> JobSpec {
     for (k, v) in settings.as_object().expect("settings are an object") {
         kernel[k] = v.clone();
     }
+    let mut budget = json!({"memory_bytes": 1u64 << 30});
+    if let Some(cpu) = cpu {
+        budget["cpu"] = json!(cpu);
+    }
     JobSpec::from_value(json!({
         "moruna_spec": 1,
         "source": {"kind": "parquet", "url": format!("file://{}", input.display())},
         "kernels": [kernel],
         "sink": {"kind": "parquet", "url": format!("file://{}", out.display())},
-        "budget": {"memory_bytes": 1u64 << 30, "cpu": 2.0},
+        "budget": budget,
         "staging": {"dir": staging.to_string_lossy(), "limit_bytes": 1u64 << 30},
         "profiles_dir": scratch.join("profiles").to_string_lossy(),
     }))
@@ -171,9 +187,12 @@ fn run_settings(
     layout: &Path,
     settings: Value,
 ) -> Result<moruna_runtime::RunReport, String> {
+    run_job(&document(scratch.path(), layout, settings))
+}
+
+fn run_job(job: &JobSpec) -> Result<moruna_runtime::RunReport, String> {
     let _serial = RUNS.lock().unwrap_or_else(|e| e.into_inner());
-    let job = document(scratch.path(), layout, settings);
-    let job = moruna_job::Job::from_v1(&job);
+    let job = moruna_job::Job::from_v1(job);
     let plan = moruna_runtime::job::plan::default_plan(&job).map_err(|e| e.to_string())?;
     let built = build(
         &job,
@@ -369,11 +388,26 @@ fn im_t23_the_process_is_alone() {
         "root in its own user namespace: {e}"
     );
     assert!(e.contains("report: pid 1"), "{e}");
+    // The job has 2 CPUs: each of its instances is told its share of them, and the thread pools
+    // are set to it (6.3f); one instance when memory funds one.
+    let line = e
+        .lines()
+        .find(|l| l.contains("report: env "))
+        .expect("an environment line");
+    let share = if line.contains("MORUNA_CPUS=1 ") {
+        1
+    } else {
+        2
+    };
     assert!(
-        e.contains(
-            "report: env EXTRA=2 FROM_IMAGE=3 MORUNA_ARGS={} MORUNA_PARAMS={} MORUNA_ROLE=function PATH=/bin\n"
-        ),
-        "exactly the image's environment with the settings' and the image contract's added: {e}"
+        line.ends_with(&format!(
+            "report: env EXTRA=2 FROM_IMAGE=3 MKL_NUM_THREADS={share} MORUNA_ARGS={{}} \
+             MORUNA_CPUS={share} MORUNA_PARAMS={{}} MORUNA_ROLE=function \
+             NUMEXPR_NUM_THREADS={share} OMP_NUM_THREADS={share} OPENBLAS_NUM_THREADS={share} \
+             PATH=/bin RAYON_NUM_THREADS={share}"
+        )),
+        "exactly the image's environment with the settings', the image contract's and its \
+         share of the CPUs added: {line}"
     );
     assert!(e.contains("report: dev null,urandom,zero"), "{e}");
     assert!(
@@ -571,4 +605,570 @@ fn im_t31_a_plane_task_that_ends_before_it_answers_is_named() {
         "{quit}"
     );
     assert!(quit.contains("for 1 sent"), "{quit}");
+}
+
+/// What the run's report says of the image stage's instances (`ImageKernel::note`): how many
+/// there were, the most that held a batch at once, and the batches each answered.
+fn instances_of(report: &moruna_runtime::RunReport) -> (usize, usize, Vec<u64>) {
+    let json: Value = serde_json::from_str(&report.to_json()).unwrap();
+    let note = json["notes"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(Value::as_str)
+        .find(|n| n.starts_with("image `kernels[0]`: "))
+        .unwrap_or_else(|| panic!("no note of the image's instances: {}", json["notes"]));
+    instances_said(note)
+}
+
+/// The figures of an image stage's note.
+fn instances_said(note: &str) -> (usize, usize, Vec<u64>) {
+    fn number(text: &str) -> u64 {
+        text.split_whitespace()
+            .next()
+            .and_then(|n| n.parse().ok())
+            .unwrap_or_else(|| panic!("no number at `{text}`"))
+    }
+    fn after<'a>(note: &'a str, mark: &str) -> &'a str {
+        let at = note
+            .find(mark)
+            .unwrap_or_else(|| panic!("no `{mark}` in: {note}"));
+        &note[at + mark.len()..]
+    }
+    let batches = note
+        .split("; ")
+        .filter(|part| part.starts_with("instance "))
+        .map(|part| number(part.split_once(": ").expect("its batches").1))
+        .collect();
+    (
+        number(after(note, "`: ")) as usize,
+        number(after(note, "busy_peak ")) as usize,
+        batches,
+    )
+}
+
+/// The rows of the instance tests' input: batches of half a mebibyte and more, so what a
+/// process holds whatever its batch (its program, a few MiB) is not read as bytes a byte of
+/// morsel by the controller's fit of the run's first morsels (6.3f: with 5 KB batches it read
+/// 115 to 215 bytes a byte and kept the run at one worker).
+const ROWS_WIDE: i64 = 1 << 21;
+
+/// IM-T32 an_image_function_runs_one_instance_per_cpu_of_the_job (system design 3E, item 6.3f):
+/// an image function that declares nothing, in a job with 4 CPUs, runs 4 instances and its
+/// batches go to all of them. It ran one process, however many CPUs the job had. Nothing
+/// measured it, so its stage warms up on its first instance and the fit funds all four.
+#[test]
+#[ignore = "Linux, sandbox host: root, and MORUNA_SANDBOX_CGROUP"]
+fn im_t32_an_image_function_runs_one_instance_per_cpu_of_the_job() {
+    const BATCHES: usize = 32;
+    const ROWS: i64 = ROWS_WIDE;
+    let scratch = Scratch::new("im_t32");
+    let layout = layout(&scratch);
+    write_parquet_in(&scratch.path().join("in.parquet"), ROWS, BATCHES);
+    // A function that takes its time over a batch, so the batches are there for every
+    // instance: 32 of them, 150 milliseconds each, long enough for the controller to come back
+    // to four workers after the warm-up, one a quarter second.
+    let job = job_of(
+        scratch.path(),
+        &layout,
+        json!({"command": ["/bin/arrow_echo", "--sleep-ms", "150"]}),
+        Some(4.0),
+    );
+    let report = run_job(&job).unwrap_or_else(|e| panic!("{e}"));
+    let (instances, busy_peak, batches) = instances_of(&report);
+    assert_eq!(instances, 4, "one instance for each CPU of the job");
+    assert_eq!(batches.len(), 4);
+    assert!(
+        batches.iter().all(|answered| *answered > 0),
+        "its batches go to all of them: {batches:?}; notes: {:#?}",
+        report.notes
+    );
+    assert!(batches.iter().sum::<u64>() >= BATCHES as u64, "{batches:?}");
+    assert_eq!(
+        busy_peak, 4,
+        "all four held a batch at once: {batches:?}; notes: {:#?}",
+        report.notes
+    );
+    // The first instance measured the function on the job's first five batches, and the fit
+    // funded every instance.
+    let note = report
+        .notes
+        .iter()
+        .find(|n| n.starts_with("image `kernels[0]`: "))
+        .expect("the stage's note");
+    assert!(
+        note.contains("; warmed up on its first instance over 5 pieces in ")
+            && note.contains("; its 4 instances funded at pieces of "),
+        "{note}"
+    );
+    // Every row, once, whichever instance answered its batch.
+    assert_eq!(
+        ids(&scratch.path().join("out")),
+        (0..ROWS).collect::<Vec<_>>()
+    );
+    let json: Value = serde_json::from_str(&report.to_json()).unwrap();
+    let stage = json["stages"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|s| s["stage"] == 1)
+        .expect("the image's stage");
+    assert_eq!(stage["rows_in"], ROWS);
+    assert_eq!(stage["rows_out"], ROWS);
+}
+
+/// The test's process in a cgroup of its own with a CPU quota, beside the stages' cgroups,
+/// until it is dropped: what a container or a service unit gives a Linux node's engine.
+struct Quota {
+    dir: PathBuf,
+    back: PathBuf,
+}
+
+impl Quota {
+    /// With `cpu_max` as the cgroup's `cpu.max`: a quota and its period, in microseconds.
+    fn enter(cpu_max: &str) -> Quota {
+        let own = std::fs::read_to_string("/proc/self/cgroup").expect("/proc/self/cgroup");
+        let path = own
+            .lines()
+            .find_map(|l| l.strip_prefix("0::"))
+            .expect("a cgroup v2 path")
+            .trim()
+            .trim_start_matches('/');
+        let back = Path::new("/sys/fs/cgroup").join(path).join("cgroup.procs");
+        let dir = cgroup().join(format!("quota-{}", std::process::id()));
+        std::fs::create_dir(&dir).unwrap_or_else(|e| panic!("{}: {e}", dir.display()));
+        std::fs::write(dir.join("cpu.max"), cpu_max).expect("cpu.max");
+        std::fs::write(dir.join("cgroup.procs"), std::process::id().to_string())
+            .expect("the test's process joins its quota's cgroup");
+        Quota { dir, back }
+    }
+}
+
+impl Drop for Quota {
+    fn drop(&mut self) {
+        let _ = std::fs::write(&self.back, std::process::id().to_string());
+        let _ = std::fs::remove_dir(&self.dir);
+    }
+}
+
+/// IM-T33 under_a_cpu_quota_the_instances_are_the_engine_s_workers (item 6.3f): a job that
+/// names no `budget.cpu`, on a node whose engine a cgroup gives 2 CPUs, runs an image function
+/// as 2 instances, the workers the engine starts for that run; and with a quota of 2.5 CPUs,
+/// as 3 and 3. Both come from the run's CPU quota as the engine's discovery found it, rounded
+/// up.
+#[test]
+#[ignore = "Linux, sandbox host: root, and MORUNA_SANDBOX_CGROUP"]
+fn im_t33_under_a_cpu_quota_the_instances_are_the_engine_s_workers() {
+    const ROWS: i64 = ROWS_WIDE;
+    assert!(
+        std::env::var_os("MORUNA_CPU").is_none(),
+        "MORUNA_CPU would stand in for the quota this test sets"
+    );
+    for (name, cpu_max, quota, expected) in [
+        ("im_t33_whole", "200000 100000", 2.0, 2),
+        ("im_t33_fraction", "250000 100000", 2.5, 3),
+    ] {
+        let scratch = Scratch::new(name);
+        let layout = layout(&scratch);
+        write_parquet_in(&scratch.path().join("in.parquet"), ROWS, 16);
+        let job = job_of(
+            scratch.path(),
+            &layout,
+            json!({"command": ["/bin/arrow_echo", "--sleep-ms", "20"]}),
+            None,
+        );
+        let held = Quota::enter(cpu_max);
+        let ran = run_job(&job);
+        drop(held);
+        let report = ran.unwrap_or_else(|e| panic!("{cpu_max}: {e}"));
+        let json: Value = serde_json::from_str(&report.to_json()).unwrap();
+        // The engine's workers for the run: its CPU quota as discovery found it, rounded up.
+        let limits = &json["limits_initial"];
+        assert_eq!(limits["cpu_quota"].as_f64(), Some(quota), "{limits}");
+        let workers = quota.ceil() as usize;
+        assert_eq!(workers, expected);
+        let (instances, _, batches) = instances_of(&report);
+        assert_eq!(
+            instances, workers,
+            "{cpu_max}: an instance for each of the engine's workers"
+        );
+        assert!(
+            batches.iter().all(|answered| *answered > 0),
+            "{batches:?}; notes: {:#?}",
+            report.notes
+        );
+        assert_eq!(
+            ids(&scratch.path().join("out")),
+            (0..ROWS).collect::<Vec<_>>()
+        );
+    }
+}
+
+const GIB: u64 = 1 << 30;
+
+/// The fixture's image unpacked, as the `image` kind unpacks it.
+fn unpacked(scratch: &Scratch, layout: &Path) -> moruna_image::Image {
+    let digest = image_of(layout)["digest"]
+        .as_str()
+        .expect("a digest")
+        .to_string();
+    let source = moruna_image::OciLayout::open(layout).expect("the layout");
+    moruna_image::unpack(&source, &digest, &scratch.path().join("images")).expect("unpacked")
+}
+
+/// The kernel of the fixture's `arrow_echo`, in a job of `cpus` CPUs.
+fn echo_kernel(image: &moruna_image::Image, cpus: usize) -> moruna_sandbox::ImageKernel {
+    moruna_sandbox::ImageKernel::new(
+        "echo",
+        image,
+        Some(vec!["/bin/arrow_echo".into()]),
+        &Default::default(),
+        cgroup(),
+        false,
+        cpus,
+    )
+    .expect("the kernel")
+}
+
+/// A run whose sampler says it holds `anon` bytes under `ceiling`, with a quota of `cpu`.
+fn sampler(anon: u64, ceiling: u64, cpu: f64) -> Arc<dyn moruna_kernel::Sampler> {
+    Arc::new(
+        moruna_testkit::FakeSampler::new().scripted(vec![moruna_kernel::Sample {
+            anon_bytes: anon,
+            ceiling_bytes: ceiling,
+            cpu_limit: cpu,
+            ..moruna_kernel::Sample::default()
+        }]),
+    )
+}
+
+fn init_ctx(instance: usize) -> moruna_kernel::InitCtx {
+    moruna_kernel::InitCtx {
+        instance,
+        device: None,
+        alloc: Arc::new(moruna_testkit::FakeAllocator::new()),
+    }
+}
+
+fn state_of(state: &mut Box<dyn moruna_kernel::KernelState>) -> &mut moruna_sandbox::ImageState {
+    state
+        .as_any_mut()
+        .downcast_mut::<moruna_sandbox::ImageState>()
+        .expect("an image's state")
+}
+
+fn cgroup_file(dir: &Path, file: &str) -> String {
+    std::fs::read_to_string(dir.join(file))
+        .unwrap_or_else(|e| panic!("{}/{file}: {e}", dir.display()))
+        .trim()
+        .to_string()
+}
+
+/// One batch through an instance; the rows it answered.
+fn echo(
+    kernel: &moruna_sandbox::ImageKernel,
+    state: &mut dyn moruna_kernel::KernelState,
+    rows: i64,
+) -> usize {
+    use moruna_kernel::Kernel;
+    let batch = RecordBatch::try_new(
+        Arc::new(Schema::new(vec![Field::new("id", DataType::Int64, false)])),
+        vec![Arc::new(Int64Array::from_iter_values(0..rows)) as ArrayRef],
+    )
+    .expect("a batch");
+    let input = moruna_kernel::Payload::Table(batch, moruna_kernel::Tier::Host);
+    match kernel.apply(state, input).unwrap_or_else(|e| panic!("{e}")) {
+        moruna_kernel::Payload::Table(out, _) => out.num_rows(),
+        moruna_kernel::Payload::Tensor(..) => panic!("a table"),
+    }
+}
+
+/// IM-T34 a_stage_s_cgroup_holds_one_for_each_instance (item 6.3f): the stage has one cgroup,
+/// which carries the stage's ceiling and the run's CPU quota, and one under it for each
+/// instance with its share; what the stage holds outside the engine is the sum over them; a
+/// change of the limits is written to all of them; and they go with their instances, the
+/// stage's last.
+#[test]
+#[ignore = "Linux, sandbox host: root, and MORUNA_SANDBOX_CGROUP"]
+fn im_t34_a_stage_s_cgroup_holds_one_for_each_instance() {
+    use moruna_kernel::Kernel;
+    let scratch = Scratch::new("im_t34");
+    let layout = layout(&scratch);
+    let image = unpacked(&scratch, &layout);
+    let k = echo_kernel(&image, 1);
+    assert_eq!(k.instances(), 1, "as the build found the job's CPUs");
+    // The run's CPUs are 4: an instance for each.
+    k.bind_run(sampler(0, GIB, 4.0), GIB);
+    assert_eq!(k.instances(), 4);
+    let outside = k.outside();
+    assert_eq!(outside.in_use().unwrap(), 0, "no instance yet");
+
+    let mut states: Vec<_> = (0..4)
+        .map(|i| k.init(&init_ctx(i)).unwrap_or_else(|e| panic!("{e}")))
+        .collect();
+    let stage = state_of(&mut states[0]).stage_cgroup();
+    assert_eq!(stage.parent(), Some(cgroup().as_path()));
+    assert_eq!(cgroup_file(&stage, "memory.max"), GIB.to_string());
+    assert_eq!(cgroup_file(&stage, "cpu.max"), "400000 100000");
+    assert_eq!(cgroup_file(&stage, "cgroup.subtree_control"), "cpu memory");
+    assert_eq!(
+        cgroup_file(&stage, "cgroup.procs"),
+        "",
+        "it holds no process itself"
+    );
+    let mut dirs = Vec::new();
+    for state in &mut states {
+        let st = state_of(state);
+        assert_eq!(st.stage_cgroup(), stage, "one cgroup for the stage");
+        let dir = st.cgroup();
+        assert_eq!(
+            dir.parent(),
+            Some(stage.as_path()),
+            "an instance's is under it"
+        );
+        assert_eq!(cgroup_file(&dir, "memory.max"), (GIB / 4).to_string());
+        assert_eq!(cgroup_file(&dir, "memory.swap.max"), "0");
+        assert_eq!(
+            cgroup_file(&dir, "cpu.max"),
+            "max 100000",
+            "the stage's holds it"
+        );
+        dirs.push(dir);
+    }
+    dirs.sort();
+    dirs.dedup();
+    assert_eq!(dirs.len(), 4, "a cgroup for each instance");
+
+    // Every instance answers its own batches, from a process in its own cgroup.
+    for (i, state) in states.iter_mut().enumerate() {
+        assert_eq!(echo(&k, state.as_mut(), 100 + i as i64), 100 + i);
+        let dir = state_of(state).cgroup();
+        assert!(
+            cgroup_file(&dir, "cgroup.events").contains("populated 1"),
+            "its process is in it"
+        );
+    }
+    // What the stage holds is the sum over its instances: more than any one of them, and
+    // what the stage's cgroup counts for them.
+    let held = outside.in_use().unwrap();
+    let each: Vec<u64> = dirs
+        .iter()
+        .map(|d| cgroup_file(d, "memory.current").parse().unwrap())
+        .collect();
+    assert!(each.iter().all(|m| *m > 0), "{each:?}");
+    assert!(held > *each.iter().max().unwrap(), "{held} of {each:?}");
+    let all: u64 = cgroup_file(&stage, "memory.current").parse().unwrap();
+    assert!(
+        held <= all + (16 << 20) && all <= held + (16 << 20),
+        "{held} and {all}"
+    );
+
+    // The limits moved: the stage's ceiling and quota, and every instance's share. The
+    // instances stay those the stage started with.
+    k.bind_run(sampler(0, GIB / 2, 1.0), GIB / 2);
+    assert_eq!(k.instances(), 4);
+    k.limits_changed();
+    assert_eq!(cgroup_file(&stage, "memory.max"), (GIB / 2).to_string());
+    assert_eq!(cgroup_file(&stage, "cpu.max"), "100000 100000");
+    for dir in &dirs {
+        assert_eq!(cgroup_file(dir, "memory.max"), (GIB / 8).to_string());
+    }
+    // And at an instance's next batch: the rest of the run grew by a quarter of a gibibyte.
+    k.bind_run(sampler(GIB / 4, GIB / 2, 1.0), GIB / 2);
+    assert_eq!(echo(&k, states[2].as_mut(), 7), 7);
+    let left: u64 = cgroup_file(&stage, "memory.max").parse().unwrap();
+    assert!(left >= GIB / 4 && left < GIB / 2, "{left}");
+    for dir in &dirs {
+        // An equal share, in whole pages of this machine's.
+        let share: u64 = cgroup_file(dir, "memory.max").parse().unwrap();
+        assert!(
+            share <= left / 4 && share + (64 << 10) > left / 4,
+            "{share} of {left}"
+        );
+    }
+
+    for state in &mut states {
+        assert!(k.finish(state.as_mut()).unwrap().is_none());
+    }
+    let (instances, busy_peak, batches) = instances_said(&k.note());
+    assert_eq!((instances, busy_peak), (4, 1), "one at a time, here");
+    assert_eq!(batches, vec![1, 1, 2, 1]);
+
+    // An instance gone takes its cgroup, and the stage's stays while one lives.
+    let first = state_of(&mut states[0]).cgroup();
+    drop(states.remove(0));
+    assert!(!first.exists());
+    assert!(stage.is_dir());
+    drop(states);
+    assert!(
+        !stage.exists(),
+        "the stage's cgroup goes with its last instance"
+    );
+    assert_eq!(outside.in_use().unwrap(), 0, "the instances are gone");
+
+    // A stage started again takes a new cgroup.
+    let mut again = k.init(&init_ctx(0)).unwrap_or_else(|e| panic!("{e}"));
+    let second = state_of(&mut again).stage_cgroup();
+    assert_ne!(second, stage);
+    drop(again);
+    assert!(!second.exists());
+}
+
+/// IM-T35 memory_bounds_an_image_s_instances (item 6.3f): the stage starts as many of the
+/// instances the rule asks for as its ceiling funds at 16 MiB each; when it funds not one, one
+/// instance has the whole of it, as before; and an image that declares a ceiling runs no more.
+#[test]
+#[ignore = "Linux, sandbox host: root, and MORUNA_SANDBOX_CGROUP"]
+fn im_t35_memory_bounds_an_image_s_instances() {
+    use moruna_kernel::Kernel;
+    const MIB: u64 = 1 << 20;
+    let scratch = Scratch::new("im_t35");
+    let layout = layout(&scratch);
+    let image = unpacked(&scratch, &layout);
+
+    // 80 MiB are left of the run's ceiling: two of four instances, 40 MiB each.
+    let k = echo_kernel(&image, 4);
+    k.bind_run(sampler(GIB - 80 * MIB, GIB, 4.0), GIB);
+    assert_eq!(k.instances(), 4, "80 MiB funds four at 16 MiB");
+    k.bind_run(sampler(GIB - 40 * MIB, GIB, 4.0), GIB);
+    assert_eq!(k.instances(), 2);
+    let mut states: Vec<_> = (0..2)
+        .map(|i| k.init(&init_ctx(i)).unwrap_or_else(|e| panic!("{e}")))
+        .collect();
+    let stage = state_of(&mut states[0]).stage_cgroup();
+    assert_eq!(cgroup_file(&stage, "memory.max"), (40 * MIB).to_string());
+    for state in &mut states {
+        let dir = state_of(state).cgroup();
+        assert_eq!(cgroup_file(&dir, "memory.max"), (20 * MIB).to_string());
+    }
+    for state in &mut states {
+        assert_eq!(echo(&k, state.as_mut(), 10), 10);
+        assert!(k.finish(state.as_mut()).unwrap().is_none());
+    }
+    let note = k.note();
+    assert!(
+        note.ends_with("; echo: 2 of 4 instances: the share funds 2"),
+        "{note}"
+    );
+    drop(states);
+
+    // 12 MiB are left, less than the least: one instance, in all of it.
+    let k = echo_kernel(&image, 4);
+    k.bind_run(sampler(GIB - 12 * MIB, GIB, 4.0), GIB);
+    assert_eq!(k.instances(), 1);
+    let mut state = k.init(&init_ctx(0)).unwrap_or_else(|e| panic!("{e}"));
+    let st = state_of(&mut state);
+    assert_eq!(
+        cgroup_file(&st.stage_cgroup(), "memory.max"),
+        (12 * MIB).to_string()
+    );
+    assert_eq!(
+        cgroup_file(&st.cgroup(), "memory.max"),
+        (12 * MIB).to_string()
+    );
+    drop(state);
+
+    // An image that declares a ceiling runs no more than it, whatever the job's CPUs.
+    let mut one = image.clone();
+    one.config.env.push("MORUNA_PROCESSES=1".into());
+    let k = echo_kernel(&one, 4);
+    k.bind_run(sampler(0, GIB, 4.0), GIB);
+    assert_eq!(k.instances(), 1);
+    let mut state = k.init(&init_ctx(0)).unwrap_or_else(|e| panic!("{e}"));
+    let st = state_of(&mut state);
+    assert_eq!(cgroup_file(&st.cgroup(), "memory.max"), GIB.to_string());
+    assert_eq!(echo(&k, state.as_mut(), 3), 3);
+    assert!(k.finish(state.as_mut()).unwrap().is_none());
+    assert_eq!(instances_said(&k.note()), (1, 1, vec![1]));
+}
+
+/// IM-T36 a_batch_past_an_instance_s_cap_goes_in_slices (system design 3A, item 6.3f): an
+/// instance takes at most what its cgroup's share holds by its function's measured line, which
+/// the kernel says to the controller; a batch past that is cut into slices of its rows, each
+/// given to the process and answered in turn, and the answers are joined in order into one
+/// batch: every row once. A batch that fits goes whole.
+#[test]
+#[ignore = "Linux, sandbox host: root, and MORUNA_SANDBOX_CGROUP"]
+fn im_t36_a_batch_past_an_instance_s_cap_goes_in_slices() {
+    use moruna_kernel::Kernel;
+    const MIB: u64 = 1 << 20;
+    const ROWS_IN: i64 = 100_000;
+    let scratch = Scratch::new("im_t36");
+    let layout = layout(&scratch);
+    let image = unpacked(&scratch, &layout);
+    let k = echo_kernel(&image, 4);
+    // A function measured to hold a KiB beside each byte of its batch: an instance's quarter of
+    // a gibibyte holds 256 KiB of input.
+    let line = moruna_cost::Memory {
+        fixed_bytes: 0.0,
+        per_input_byte: 1024.0,
+        output_per_input_byte: None,
+        spread: 0.0,
+        units: 6,
+        input_bytes_min: 4096,
+        input_bytes_max: 65536,
+    };
+    k.bind_room(1 << 44, 512 * MIB, 4 * MIB, 4.0, Some(line));
+    k.bind_run(sampler(0, GIB, 4.0), GIB);
+    assert_eq!(
+        k.instances(),
+        4,
+        "the line at the least morsel funds all four"
+    );
+    assert_eq!(k.morsel_bytes_max(), Some(256 << 10));
+    let mut state = k.init(&init_ctx(0)).unwrap_or_else(|e| panic!("{e}"));
+    assert_eq!(
+        cgroup_file(&state_of(&mut state).cgroup(), "memory.max"),
+        (GIB / 4).to_string()
+    );
+
+    // 100,000 rows of 8 bytes: past the cap, four slices of 25,000 rows.
+    let batch = RecordBatch::try_new(
+        Arc::new(Schema::new(vec![Field::new("id", DataType::Int64, false)])),
+        vec![Arc::new(Int64Array::from_iter_values(0..ROWS_IN)) as ArrayRef],
+    )
+    .expect("a batch");
+    let input = moruna_kernel::Payload::Table(batch, moruna_kernel::Tier::Host);
+    let out = match k.apply(state.as_mut(), input) {
+        Ok(moruna_kernel::Payload::Table(out, _)) => out,
+        Ok(_) => panic!("a table"),
+        Err(e) => panic!("{e}"),
+    };
+    let column = |name: &str| -> Vec<i64> {
+        out.column_by_name(name)
+            .and_then(|c| c.as_any().downcast_ref::<Int64Array>())
+            .unwrap_or_else(|| panic!("no column {name}"))
+            .values()
+            .to_vec()
+    };
+    assert_eq!(
+        column("id"),
+        (0..ROWS_IN).collect::<Vec<_>>(),
+        "every row once, in order"
+    );
+    // The process answered each slice as a batch of its own: its index restarts at each.
+    let starts: Vec<usize> = column("n")
+        .iter()
+        .enumerate()
+        .filter(|(_, n)| **n == 0)
+        .map(|(at, _)| at)
+        .collect();
+    assert_eq!(starts, vec![0, 25_000, 50_000, 75_000]);
+
+    // A batch that fits goes whole.
+    assert_eq!(echo(&k, state.as_mut(), 1000), 1000);
+    assert!(k.finish(state.as_mut()).unwrap().is_none());
+    let note = k.note();
+    assert_eq!(instances_said(&note).2, vec![5, 0, 0, 0], "{note}");
+    assert!(
+        note.contains("; 1 batches past an instance's cap cut into 4 slices"),
+        "{note}"
+    );
+    assert!(
+        note.contains(
+            "measured: batches of at most 262144 bytes, what an instance's share of 268435456 \
+             bytes holds"
+        ),
+        "{note}"
+    );
 }

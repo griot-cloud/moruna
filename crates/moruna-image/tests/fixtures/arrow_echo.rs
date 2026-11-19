@@ -1,6 +1,8 @@
 //! The program the image kind's tests run as an image's command (SDD 19 k): it reads an Arrow IPC
 //! stream on standard input and writes one back on standard output, each batch with a column `n`
 //! added (the row's index in the batch), which is the whole contract of an image (SDD 19 f.6).
+//! An input with no byte at all has no batch: it writes nothing and exits with status 0, as an
+//! instance of a stage that was given no batch must (system design 3E).
 //!
 //! One optional argument makes it misbehave, each in the way a test needs:
 //!
@@ -8,10 +10,11 @@
 //! - `--write-root` tries to create `/etc/x` after proving `/tmp` is writable;
 //! - `--garbage` writes bytes that are no Arrow stream;
 //! - `--exit 3` does its work and then exits with status 3 where it should have ended the stream;
+//! - `--sleep-ms 50` takes 50 milliseconds over each batch, as a function that computes does;
 //! - `--report` says on standard error who and where it is (its user, its process id, its
 //!   environment, the entries of `/` and of `/proc`) and exits with status 9.
 
-use std::io::{Read, Write};
+use std::io::{BufRead, Read, Write};
 use std::process::exit;
 use std::sync::Arc;
 
@@ -92,8 +95,22 @@ fn main() {
         }
     });
 
-    let mut input = StreamReader::try_new(std::io::stdin().lock(), None)
-        .unwrap_or_else(|e| die("reading the input schema", e));
+    let sleep = args.iter().position(|a| a == "--sleep-ms").map(|at| {
+        match args.get(at + 1).and_then(|ms| ms.parse::<u64>().ok()) {
+            Some(ms) => std::time::Duration::from_millis(ms),
+            None => die("--sleep-ms", "it takes milliseconds"),
+        }
+    });
+
+    let mut stdin = std::io::BufReader::new(std::io::stdin().lock());
+    match stdin.fill_buf() {
+        // No byte at all: no batch, nothing to write.
+        Ok([]) => return,
+        Ok(_) => {}
+        Err(e) => die("reading the input", e),
+    }
+    let mut input =
+        StreamReader::try_new(stdin, None).unwrap_or_else(|e| die("reading the input schema", e));
     let in_schema = input.schema();
     let mut fields: Vec<Arc<Field>> = in_schema.fields().iter().cloned().collect();
     fields.push(Arc::new(Field::new("n", DataType::Int64, false)));
@@ -108,6 +125,9 @@ fn main() {
         columns.push(Arc::new(Int64Array::from_iter_values(0..rows)));
         let echoed = RecordBatch::try_new(Arc::clone(&out_schema), columns)
             .unwrap_or_else(|e| die("building a batch", e));
+        if let Some(sleep) = sleep {
+            std::thread::sleep(sleep);
+        }
         output
             .write(&echoed)
             .unwrap_or_else(|e| die("writing a batch", e));

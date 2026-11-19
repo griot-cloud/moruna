@@ -631,8 +631,51 @@ fn drive(
     // whole region mapped for the life of the process (0.6.3).
     #[cfg(feature = "python")]
     let _release = ReleaseRun(py_kernels.iter().map(|(_, k)| k.clone()).collect());
+    // The room a stage's warm-up finds its other tasks do not need (system design 3A): the
+    // limits watcher hands it to the arena, through the arena's arithmetic.
+    let freed_room = Arc::new(std::sync::atomic::AtomicU64::new(0));
     if let Some(gate) = &gate {
+        // 6.3f: a Linux image stage funds its instances from the allowance past the arena, as
+        // the native ones are (its image stages share it). A measured function's instances are
+        // funded at its line at the least morsel and its batches held to what an instance's
+        // share holds by the line (system design 3A: the piece shrinks first); an unmeasured
+        // one's at the largest morsel times its factor, its batches at the share over it.
+        let images = packaged
+            .iter()
+            .filter(|stage| !stage.native_singleton() && stage.kind() == "image")
+            .count()
+            .max(1) as u64;
+        let image_room = sizing
+            .allowance(limits.memory_ceiling)
+            .saturating_sub(arena_bytes)
+            / images;
         for stage in packaged.iter().filter(|stage| !stage.native_singleton()) {
+            let kernel = stage.kernel();
+            let line = kernels
+                .iter()
+                .position(|k| std::ptr::addr_eq(Arc::as_ptr(k), Arc::as_ptr(&kernel)))
+                .and_then(|at| measured.get(at))
+                .and_then(Option::as_ref);
+            stage.bind_room(
+                image_room,
+                morsel_max,
+                config::MORSEL_MIN_BYTES,
+                amplification_of(&*kernel),
+                line,
+            );
+            // A function the run has no measurement of resting on enough units warms up on
+            // its stage's first instance, and its others are funded from what that finds
+            // (system design 3A: measured, never assumed), on Linux as on the node.
+            #[cfg(target_os = "linux")]
+            if stage.kind() == "image" && warms_up(line, instances_of(kernel.kind())) {
+                let freed = Arc::clone(&freed_room);
+                stage.warm_up(
+                    line,
+                    Box::new(move |bytes| {
+                        freed.fetch_add(bytes, std::sync::atomic::Ordering::Relaxed);
+                    }),
+                );
+            }
             stage.bind(gate, &sampler, limits.memory_ceiling);
         }
     }
@@ -680,9 +723,6 @@ fn drive(
         })
         .collect();
 
-    // The room a stage's warm-up finds its other tasks do not need (system design 3A): the
-    // limits watcher hands it to the arena, through the arena's arithmetic.
-    let freed_room = Arc::new(std::sync::atomic::AtomicU64::new(0));
     // Native singleton commitments must also leave the controller's initial
     // minimum-morsel work funded, before any child is started.
     #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
@@ -1818,13 +1858,19 @@ const WARM_UP_SKIPPED_AT: u64 = 32;
 /// Whether a stage of `instances` tasks whose function the node has no readings of warms up on
 /// its first task (system design 3A; PM, 2026-11-18): when what it carries (`line`, a
 /// registration's or the store's) rests on fewer than [`WARM_UP_SKIPPED_AT`] units, or there is
-/// none, and it has other tasks to size.
-#[cfg_attr(
-    not(all(target_os = "linux", target_arch = "x86_64")),
-    allow(dead_code)
-)]
+/// none, and it has other tasks to size. A Linux image stage follows the same rule (6.3f).
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
 fn warms_up(line: Option<&moruna_cost::Memory>, instances: usize) -> bool {
     instances > 1 && line.is_none_or(|m| m.units < WARM_UP_SKIPPED_AT)
+}
+
+/// The instances a kernel of `kind` may run: a stateful one's most, one for a stateless one.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+fn instances_of(kind: moruna_kernel::KernelKind) -> usize {
+    match kind {
+        moruna_kernel::KernelKind::Stateful { max_instances } => max_instances.get(),
+        moruna_kernel::KernelKind::Stateless => 1,
+    }
 }
 
 /// What the run sizes a measured stage's instances at (system design 3A).
@@ -2063,6 +2109,17 @@ fn out_of_arena(
     chain
 }
 
+/// What one kernel holds outside the arena for each byte of a batch (6.3f): what it declares,
+/// a positive number, else `DEFAULT_OUT_OF_ARENA_AMPLIFICATION`, the figure the arena and the
+/// controller assume for it.
+fn amplification_of(kernel: &dyn moruna_kernel::Kernel) -> f64 {
+    kernel
+        .hints()
+        .expected_amplification
+        .filter(|a| a.is_finite() && *a > 0.0)
+        .unwrap_or(DEFAULT_OUT_OF_ARENA_AMPLIFICATION)
+}
+
 /// The smallest region granularity 02 e.1 rounds the arena down to.
 const GRANULE_BYTES: u64 = 64 << 10;
 
@@ -2148,6 +2205,37 @@ fn summarise(plan: &[moruna_kernel::Split]) -> PlanSummary {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// 6.3f: a Linux image stage funds each instance at the largest morsel times what its
+    /// kernel declares it holds a byte, or the default for one that declares nothing it can use.
+    #[test]
+    fn a_kernel_s_factor_is_what_it_declares_or_the_default() {
+        use moruna_testkit::FakeKernel;
+        assert_eq!(amplification_of(&FakeKernel::new().amplification(2.5)), 2.5);
+        for nothing in [0.0, -1.0, f64::NAN] {
+            assert_eq!(
+                amplification_of(&FakeKernel::new().amplification(nothing)),
+                DEFAULT_OUT_OF_ARENA_AMPLIFICATION,
+                "{nothing}"
+            );
+        }
+    }
+
+    /// 6.3f: a Linux image stage warms up when it has other instances to size, as the most a
+    /// stateful kernel runs says; a stateless one runs one a worker and is not counted here.
+    #[test]
+    fn a_kernel_s_instances_are_the_most_its_kind_runs() {
+        let four = || moruna_kernel::KernelKind::Stateful {
+            max_instances: std::num::NonZeroUsize::new(4).unwrap(),
+        };
+        assert_eq!(instances_of(four()), 4);
+        assert_eq!(instances_of(moruna_kernel::KernelKind::Stateless), 1);
+        assert!(warms_up(None, instances_of(four())));
+        assert!(!warms_up(
+            None,
+            instances_of(moruna_kernel::KernelKind::Stateless)
+        ));
+    }
 
     /// MH 4.7: `staging.durable` declares `durable_staging=present`, over a profile or none,
     /// and refuses a profile that says otherwise.

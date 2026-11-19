@@ -1090,7 +1090,12 @@ impl ImageTask {
                     piece,
                 )
             };
-            let costs: Vec<u64> = layout::PIECES
+            // Down to the least piece, or to the largest the warm-up gave where the job's
+            // batches were smaller: funding never extrapolates past what was measured (PM,
+            // 2026-11-19), as a Linux host decides it.
+            let pieces =
+                moruna_adapters::instances::measured_pieces(&layout::PIECES, fit.input_bytes_max);
+            let costs: Vec<u64> = pieces
                 .iter()
                 .map(|&piece| layout::plane_for(piece).1 + account(piece))
                 .collect();
@@ -1098,7 +1103,7 @@ impl ImageTask {
             if others > 0 {
                 match moruna_adapters::instances::fund_measured(room, &[(others, costs.clone())]) {
                     Ok((at, counts)) => {
-                        let piece = layout::PIECES[at];
+                        let piece = pieces[at];
                         let count = counts.first().copied().unwrap_or(0);
                         self.size_measured(piece, account(piece), margin);
                         self.cap_pieces(piece);

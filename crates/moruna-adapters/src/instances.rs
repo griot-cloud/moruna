@@ -254,6 +254,25 @@ pub fn fund(
     }))
 }
 
+/// The pieces a stage's instances are costed at when a measurement funds them ([`fund_measured`];
+/// system design 3A, PM 2026-11-19), the largest first: the run's `pieces`, largest first and
+/// its least last, never below what was measured. Where the largest piece the measurement was
+/// taken at (`measured`, a warm-up's on a job of small batches) is under the least, the pieces
+/// above it are kept and it is the least: funding never extrapolates past what was measured,
+/// and a larger batch is cut at what an instance holds. The node and a Linux host both cost
+/// their instances by it. At least one piece, of at least a byte.
+pub fn measured_pieces(pieces: &[u64], measured: u64) -> Vec<u64> {
+    let least = pieces
+        .last()
+        .copied()
+        .unwrap_or(u64::MAX)
+        .min(measured)
+        .max(1);
+    let mut out: Vec<u64> = pieces.iter().copied().filter(|&p| p > least).collect();
+    out.push(least);
+    out
+}
+
 /// Funds the stages whose functions the node measured (system design 3A; PM, 2026-11-18): each
 /// stage asks for `wanted` instances, and `costs[k]` is what one of its instances costs at the
 /// `k`th of the pieces, the largest first (its plane and its account at that piece). The largest
@@ -337,6 +356,64 @@ pub fn count_note(instances: usize, cpus: usize) -> String {
     }
 }
 
+/// The name an instance's environment holds its share of the job's CPUs under
+/// ([`cpu_share`]): every instance of a stage is told it.
+pub const CPUS_ENV: &str = "MORUNA_CPUS";
+
+/// The thread pools a function's libraries size themselves by (OpenMP, OpenBLAS, MKL, NumExpr,
+/// Rayon), each set to the instance's share of the CPUs unless its image's environment sets it,
+/// as Dask, Ray and Spark size a worker's: a process left to them takes every CPU of the
+/// machine, and instances that each do so oversubscribe the job's (6.3f, the Score table).
+pub const THREAD_POOLS: [&str; 5] = [
+    "OMP_NUM_THREADS",
+    "OPENBLAS_NUM_THREADS",
+    "MKL_NUM_THREADS",
+    "NUMEXPR_NUM_THREADS",
+    "RAYON_NUM_THREADS",
+];
+
+/// Each instance's share of the job's `cpus` among a stage's `instances`: the whole CPUs it has
+/// to itself, at least one.
+pub fn cpu_share(cpus: usize, instances: usize) -> usize {
+    (cpus / instances.max(1)).max(1)
+}
+
+/// `env` (each `NAME=VALUE`) as an instance is given it: [`CPUS_ENV`] set to its `share`, in
+/// place of any the environment holds, which is the runner's to give; then each of
+/// [`THREAD_POOLS`] the environment does not set, set to the share.
+pub fn with_cpu_share(env: &[String], share: usize) -> Vec<String> {
+    let name = |entry: &String| {
+        entry
+            .split_once('=')
+            .map_or(entry.clone(), |(n, _)| n.into())
+    };
+    let mut given: Vec<String> = env
+        .iter()
+        .filter(|entry| name(entry) != CPUS_ENV)
+        .cloned()
+        .collect();
+    given.push(format!("{CPUS_ENV}={share}"));
+    for pool in THREAD_POOLS {
+        if !env.iter().any(|entry| name(entry) == pool) {
+            given.push(format!("{pool}={share}"));
+        }
+    }
+    given
+}
+
+/// What one instance needs at the least while a function's memory is not yet measured for the
+/// shares to follow (system design 3A, item 6.3g): the largest batch the run may give it,
+/// `morsel` bytes, times `factor`, what the function holds for each byte of a batch (its
+/// measured factor, or the run's default when it has none); never under `least`. A factor that is
+/// not a positive number counts as none, and the need is `least`.
+pub fn need(morsel: u64, factor: f64, least: u64) -> u64 {
+    if !(factor.is_finite() && factor > 0.0) {
+        return least;
+    }
+    // A product past `u64` saturates: no room funds it, and one instance is started.
+    ((morsel as f64 * factor).ceil() as u64).max(least)
+}
+
 #[cfg(test)]
 mod measured_tests {
     use super::*;
@@ -384,6 +461,53 @@ mod measured_tests {
         // A stage asking for none is asked for one.
         assert_eq!(fund_measured(1 << 40, &[(0, costs())]), Ok((0, vec![1])));
     }
+
+    /// PM, 2026-11-19 (6.3f): the least piece is never below what was measured, so a warm-up
+    /// on a job of tiny batches of one size, which says no slope, funds every instance at the
+    /// piece it measured, not 1 of 2 at a piece it extrapolated to.
+    #[test]
+    fn tiny_one_size_warm_up_batches_fund_every_instance() {
+        let ladder = [16 * MIB, 8 * MIB, 4 * MIB, 2 * MIB, MIB];
+        // What was measured is above the least, or at it: the run's pieces as they are.
+        assert_eq!(measured_pieces(&ladder, 16 * MIB), ladder.to_vec());
+        assert_eq!(measured_pieces(&ladder, MIB), ladder.to_vec());
+        // A warm-up on 9 KiB batches: those above it kept, and it the least.
+        let tiny = 9 << 10;
+        let pieces = measured_pieces(&ladder, tiny);
+        assert_eq!(pieces.len(), 6);
+        assert_eq!(pieces.last(), Some(&tiny));
+        assert!(pieces[..5] == ladder[..]);
+        // Its line has no slope: 3 MiB whatever the batch, scaled in proportion past 9 KiB.
+        let fixed = 3 * MIB;
+        let cost = |piece: u64| {
+            if piece > tiny {
+                fixed * piece / tiny
+            } else {
+                fixed
+            }
+        };
+        // Room for one at the run's least piece of 1 MiB (341 MiB), not two.
+        let room = 512 * MIB;
+        let at_least = ladder.iter().map(|&p| cost(p)).collect::<Vec<_>>();
+        assert_eq!(
+            fund_measured(room, &[(2, at_least)]),
+            Ok((4, vec![1])),
+            "costed at the run's least alone, 1 of 2"
+        );
+        let measured = pieces.iter().map(|&p| cost(p)).collect::<Vec<_>>();
+        assert_eq!(
+            fund_measured(room, &[(2, measured)]),
+            Ok((5, vec![2])),
+            "costed down to what was measured, both"
+        );
+        // No pieces at all: what was measured alone, and never a zero piece.
+        assert_eq!(measured_pieces(&[], tiny), vec![tiny]);
+        assert_eq!(measured_pieces(&ladder, 0), {
+            let mut all = ladder.to_vec();
+            all.push(1);
+            all
+        });
+    }
 }
 
 #[cfg(test)]
@@ -391,6 +515,64 @@ mod tests {
     use super::*;
 
     const MIB: u64 = 1 << 20;
+
+    fn entries(text: &[&str]) -> Vec<String> {
+        text.iter().map(|e| e.to_string()).collect()
+    }
+
+    /// PM, 2026-11-18 (6.3f): each instance is told its share of the job's CPUs, and the thread
+    /// pools are set to it unless the image sets them.
+    #[test]
+    fn each_instance_is_told_its_share_of_the_cpus() {
+        assert_eq!(cpu_share(4, 4), 1);
+        assert_eq!(cpu_share(4, 1), 4);
+        assert_eq!(cpu_share(4, 2), 2);
+        assert_eq!(cpu_share(4, 3), 1, "whole CPUs only");
+        assert_eq!(cpu_share(3, 8), 1, "at least one");
+        assert_eq!(cpu_share(8, 0), 8);
+        let given = with_cpu_share(
+            &entries(&[
+                "PATH=/bin",
+                "OPENBLAS_NUM_THREADS=7",
+                "MORUNA_CPUS=9",
+                "ODD",
+            ]),
+            2,
+        );
+        assert_eq!(
+            given,
+            entries(&[
+                "PATH=/bin",
+                "OPENBLAS_NUM_THREADS=7",
+                "ODD",
+                "MORUNA_CPUS=2",
+                "OMP_NUM_THREADS=2",
+                "MKL_NUM_THREADS=2",
+                "NUMEXPR_NUM_THREADS=2",
+                "RAYON_NUM_THREADS=2",
+            ]),
+            "the image's own pool setting stands; MORUNA_CPUS is the runner's"
+        );
+        let given = with_cpu_share(&[], 1);
+        assert_eq!(given.len(), 1 + THREAD_POOLS.len());
+        assert!(given.iter().all(|e| e.ends_with("=1")), "{given:?}");
+    }
+
+    #[test]
+    fn an_instance_needs_the_largest_batch_times_its_factor() {
+        assert_eq!(need(512 * MIB, 4.0, 16 * MIB), 2048 * MIB);
+        assert_eq!(need(32 * MIB, 1.5, 16 * MIB), 48 * MIB);
+        assert_eq!(need(MIB, 2.0, 16 * MIB), 16 * MIB, "never under the least");
+        for none in [0.0, -1.0, f64::NAN, f64::INFINITY] {
+            assert_eq!(need(512 * MIB, none, 16 * MIB), 16 * MIB, "{none}");
+        }
+        assert_eq!(need(u64::MAX, 4.0, 1), u64::MAX, "saturates");
+        // What it funds: 4 GiB past the arena, 512 MiB batches at the default factor of 4.
+        let funded = fund(4096 * MIB, &[4], 4096, need(512 * MIB, 4.0, 16 * MIB))
+            .unwrap()
+            .unwrap();
+        assert_eq!(funded.counts, vec![2]);
+    }
     const PAGE: u64 = 4096;
 
     fn env(entries: &[&str]) -> Vec<String> {
