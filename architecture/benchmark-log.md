@@ -417,4 +417,4 @@ request budget reached the seventeenth.
     That is item 6.3ab.
 - **6.3x's stall did not occur in 12 Occupancy and Audit runs**, the second run in a row.
 
-The outputs' bit-for-bit check was still running when this was written.
+Every output is bit for bit (24 of 24).
