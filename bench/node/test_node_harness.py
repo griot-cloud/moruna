@@ -876,9 +876,12 @@ def test_a_whole_run_against_fakes(tmp_path):
     assert ("POST", "/v1/jobs", "t-submit") in x.node.calls and ("GET", "/v1/node", "t-observe") in x.node.calls
     assert ("POST", "/v1/functions", "t-admin") in x.node.calls and ("GET", "/v1/functions", "t-observe") in x.node.calls
     # The console's blob was read again while it was not there yet (get-boot-log, tried each time it
-    # was not, failed on the CLI's bug); its address asked once.
+    # was not, failed on the CLI's bug); its address asked once. After it, once more after each node
+    # job for the network meters (6.3ab), which are kept beside the job's record.
+    jobs = sorted(n for n in os.listdir(tmp_path / "node") if n.endswith(".job.json"))
     assert sum("blob download -c bootdiagnostics-morunanod-0b1c -n moruna-node.0b1c.serialconsole.log" in a
-               for a in x.azs) == 3
+               for a in x.azs) == 3 + len(jobs)
+    assert all((tmp_path / "node" / n.replace(".job.json", ".meters.json")).exists() for n in jobs)
     assert sum("get-boot-log-uris" in a for a in x.azs) == 1
     assert sum("get-boot-log -n" in a for a in x.azs) == 2
     node_rec = json.load(open(tmp_path / "node" / "score-moruna-node-r1.json"))

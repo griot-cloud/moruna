@@ -587,6 +587,16 @@ class Bench:
         the boot diagnostics blob in the run's account, read directly with its key; the CLI's
         get-boot-log only when that fails (on 2026-11-18 it failed on every call, on the CLI's own
         bug). A `moruna: fatal` line stops the run."""
+        text = self.console_text()
+        if text is None:
+            return None
+        info = node_api.console(text or "")
+        if info.get("fatal"):
+            raise RuntimeError(f"the node stopped: moruna: fatal {info['fatal']}")
+        return info
+
+    def console_text(self):
+        """The node's serial console as it stands, or None while it cannot be read (see console)."""
         x, c, s = self.x, self.c, self.secrets
         try:
             if self.console_at is None:
@@ -605,10 +615,20 @@ class Bench:
             except RuntimeError as e2:
                 self.once(f"nor by get-boot-log: {str(e2)[-160:]}")
                 return None
-        info = node_api.console(text or "")
-        if info.get("fatal"):
-            raise RuntimeError(f"the node stopped: moruna: fatal {info['fatal']}")
-        return info
+        return text
+
+    def keep_meters(self, spec):
+        """Item 6.3ab: the node's network meters as they stood when a job ended, beside its
+        record. The network server and netvsc say a meter line at most every 10 s while bytes
+        move, and the network server one more when a job's last TLS socket closes; each counts
+        from its process's start, so the difference between two jobs' last lines is what the job
+        moved. The console is read once more after the job, never during it."""
+        text = self.console_text()
+        if not text:
+            return
+        keep = [line for line in text.splitlines()
+                if "netstack: meter" in line or "netvsc: meter" in line or "netstack: crypto" in line]
+        self.x.save(os.path.join(self.results, "node", f"{spec['id']}.meters.json"), {"lines": keep})
 
     def once(self, text):
         """A note, unless it is the one said last (a poll says the same thing many times)."""
@@ -929,6 +949,7 @@ class Bench:
                 return
             self.x.note(f"run {spec['id']}")
             self.moruna(spec)
+            self.keep_meters(spec)
 
     def moruna(self, spec):
         """One job on the node, as proof.py runs one: its document (the registered function by
