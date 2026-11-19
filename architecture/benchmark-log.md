@@ -418,3 +418,26 @@ request budget reached the seventeenth.
 - **6.3x's stall did not occur in 12 Occupancy and Audit runs**, the second run in a row.
 
 Every output is bit for bit (24 of 24).
+
+### Run 202611190704, run 9: the node alone at feature's tip (PM, 2026-11-19)
+
+Run 8b plus three changes: 6.3m (an answer belongs to its morsel), 6.3v (Linux only) and 6.3z (a
+ring task stamps each piece's time). The gate tasks are rebuilt at the same commit, and attach at
+version 5.
+
+| Job | Runs | Run 9 (s) | Run 8b (s) |
+|---|---|---|---|
+| Score | 6 of 6 | 51.3, 52.6, 54.1, 53.2, 52.4, 53.4 | 48.6–50.0 |
+| Occupancy | 6 of 6 | 16.9, 17.3, 17.7, 16.7, 16.9, 17.9 | 16.0–16.8 |
+| Enrich | 6 of 6 | 62.7, 62.1, 64.2, 61.1, 57.8, 60.1 | 53.7–61.8 |
+| Audit | 6 of 6 | 18.1, 18.5, 18.2, 17.7, 17.9, 18.5 | 16.8–17.7 |
+
+- **Every output is bit for bit (24 of 24). 6.3x's stall did not occur for the third run.**
+- **Every job is about 5% slower: the morsel search settled smaller.**
+  - Score: 16.8 → 8.4 → 4.2 MB, against 15.9 → 8.0 → 5.7.
+  - Audit: 8.4 MB, against 16.8.
+  - Score read in 863 pieces against 465, and decoded for 34.9 s against 25.7 s, summed.
+- **Why:** with 6.3m and 6.3z, a ring morsel's record carries the function's own time, which falls
+  on smaller morsels. The search counts only that, not the extra reads, decodes and encodes a
+  smaller morsel costs the engine. Item 6.3ac makes the search's cost the whole stage's CPU per
+  byte.
