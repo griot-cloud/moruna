@@ -15,8 +15,8 @@ Boot evidence is kept in `~/moruna-data/boots/` (chain logs, scripts, run report
 
 | Item | Branch | State |
 |---|---|---|
-| 6.3z a ring task stamps each piece's time (since 06:10Z) | `work/6.3z-ring-task-stamps-piece-time` from feature | Building the work item: the task's take-to-release time less its window waits, on the clock page, carried on the release; `Released.piece_ns`; morsels `Given` when every piece is timed |
-| 6.3w the anon fit on small morsels (since 06:10Z) | `work/6.3w-anon-fit-on-small-morsels` from feature | Building the work item: the stage's measured line goes to the controller; the no-spread fallback takes its slope, the constant the rest |
+| 6.3z a ring task stamps each piece's time (since 06:10Z) | `work/6.3z-ring-task-stamps-piece-time` b4f76b86 | Built (the released entry's rows word, attach version 5, both directions compatible; 97.6% of plane lines); one change asked (06:25Z): input waits add nothing to held batches, as window waits do not |
+| 6.3w the anon fit on small morsels (since 06:10Z) | `work/6.3w-anon-fit-on-small-morsels` 57f7f5fb | Host part built (RC-T27: 5 KB morsels 216 → 2.0 B/B, workers stay 4); now the PM's answer (06:35Z): the warm-up's line reaches the controller mid-run on the stage's counters, the probe seeded from the line; then IM-T32/33 in moruna-arm |
 
 ## The PM's, in order
 
