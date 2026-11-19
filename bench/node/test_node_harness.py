@@ -2340,7 +2340,7 @@ def test_each_engine_lands_on_the_newest_cpython_it_installs_and_imports_on(tmp_
     root = tmp_path / "root"
     assert install.main(["--root", str(root), "--gate-src", str(tmp_path), "--engines", "ray"]) == 0
     assert install.PIP["ray"][1] == ["ray[data]", "typing-extensions", "aiohttp", "pyarrow", "pandas", "numpy"]
-    assert all(c[-5:] == install.PIP["ray"][1] for c in seen if c[:3] == ["uv", "pip", "install"])
+    assert all(c[-len(install.PIP["ray"][1]):] == install.PIP["ray"][1] for c in seen if c[:3] == ["uv", "pip", "install"])
     ray = json.load(open(root / "installed.json"))["ray"]
     assert (ray["ok"], ray["interpreter"], ray["python"], ray["gil"]) == (True, "3.12+gil", "3.12.3", True)
     assert ray["tried"] == [{"python": "3.14+gil", "error": "did not import: ray.data (missing: ModuleNotFoundError)"},
