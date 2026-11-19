@@ -444,3 +444,33 @@ version 5.
     moved the search.
   - The search also counts none of the decode and encode a smaller morsel costs.
   - Item 6.3ac makes its cost the stage's whole CPU per byte, from counters that miss no unit.
+
+### Run 202611190756, run 10: the node alone at 80ce24c6 (PM, 2026-11-19)
+
+Run 9 plus 6.3w (the anon fit takes the measured line) and 6.3ab's network meters, with the
+harness keeping each job's meter lines. It does not have 6.3ac (merged later).
+
+| Job | Runs | Run 10 (s) | Run 9 (s) |
+|---|---|---|---|
+| Score | 6 of 6 | 54.2, 54.5, 54.1, 54.0, 53.0, 52.9 | 51.3–54.1 |
+| Occupancy | 6 of 6 | 18.2, 18.8, 17.8, 17.7, 18.2, 17.4 | 16.7–17.9 |
+| Enrich | 6 of 6 | 63.5, 65.4, 62.8, 65.5, 64.9, 63.9 | 57.8–64.2 |
+| Audit | 5 of 6 | 18.6, 18.4, 17.8, 18.1, 18.4; r5 failed at 74.6 s | 17.7–18.5 |
+
+- **Every completed output is bit for bit (23).**
+- **Audit r5 failed with 6.3x's error**, "it said a batch was done without a record". It had not
+  occurred in runs 7 to 9, and it is not closed.
+  - Two tasks each had two more batches than records (123/121, 165/163).
+  - The stage was Idle 58.6 s of 74.6 s, and its workers spent 120 s summed taking answers.
+- **The meters name the network ceiling.** The network server's totals at the node's 405th second:
+  - it handed 5.06 GB to its clients in 87.3 s of copying, 58 MB/s, which is the node's ceiling;
+  - its TLS decrypt ran 5.06 GB in 10.9 s (464 MB/s; ring's AES-NI);
+  - it tried every pending receive at every poll: 149,618 answered of 5,205,680 tried;
+  - netvsc dropped 16,716 frames and left frames queued in 82,805 of 141,067 answers.
+
+  The copies and the retries are item 6.3ad.
+- **About 3–6% slower than run 9 on every job but Score**, cause not yet named. Candidates:
+  - the meter lines, each holding the serial console tens of ms at most every 10 s;
+  - 6.3w's workers.
+
+  Run 11 has 6.3ac and should show where it stands.
