@@ -738,16 +738,31 @@ fn drive(
                         target,
                     )
                     .saturating_mul(fit.lanes as u64);
-                    let above = want.saturating_sub(fit.bytes()).min(spare);
+                    let wanted_above = want.saturating_sub(fit.bytes());
+                    let above = wanted_above.min(spare);
                     spare -= above;
                     let granted = fit.bytes() + above;
                     if above > 0 {
+                        let reach = if above == wanted_above {
+                            format!(
+                                "so each of their {} lanes reaches its row group target of \
+                                 {target} bytes before its heap",
+                                fit.lanes
+                            )
+                        } else {
+                            format!(
+                                "all the room above the arena beside the claims; each of their \
+                                 {} lanes would need {} bytes to reach its row group target of \
+                                 {target} bytes before its heap, so its row groups are flushed \
+                                 by its heap",
+                                fit.lanes,
+                                want / fit.lanes.max(1) as u64
+                            )
+                        };
                         notes.push(format!(
                             "sink {sink}'s writers are granted {granted} bytes, {above} above their \
-                             claim of {}, so each of their {} lanes reaches its row group target \
-                             of {target} bytes before its heap",
+                             claim of {}, {reach}",
                             fit.bytes(),
-                            fit.lanes
                         ));
                     }
                     writer_grants[*at] = Some(granted);

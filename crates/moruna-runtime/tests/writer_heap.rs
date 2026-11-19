@@ -647,6 +647,36 @@ fn at_an_ample_budget_the_row_groups_reach_the_sinks_target() {
     assert_eq!(support::read_back_rows(&out), 6 * 50_000);
 }
 
+/// 3A, 6.3d: a row group target past what the room above the arena holds beside the claims:
+/// the writers are granted all of it, their row groups are flushed by their heap, and the report
+/// says so rather than that they reach the target.
+#[test]
+fn a_target_past_the_room_is_flushed_by_the_heap_and_said() {
+    let _serial = one_run_at_a_time();
+    let scratch = Scratch::new("writer_heap_past_room");
+    let file = scratch.path().join("in.parquet");
+    grouped(&file, 6, 50_000, scattered(32));
+    let out = scratch.path().join("out");
+    let outcome = copy_with_target(&scratch, &file, &out, BUDGETS[1], 1 << 30);
+    apart::within(&outcome, "a copy past its room", BUDGETS[1]);
+    let held = outcome["sink"]["held_peak"].as_i64().expect("measured");
+    let (writers, _, _, _) = claim(&outcome).expect("the claims");
+    assert!(held <= writers as i64, "{held} over {writers}");
+    let notes = notes(&outcome);
+    assert!(
+        notes.iter().any(|n| n.contains("above their claim")
+            && n.contains("so its row groups are flushed by its heap")),
+        "the report says the heap flushes the row groups: {notes:?}"
+    );
+    assert!(
+        !notes
+            .iter()
+            .any(|n| n.contains("reaches its row group target")),
+        "{notes:?}"
+    );
+    assert_eq!(support::read_back_rows(&out), 6 * 50_000);
+}
+
 /// 3A, 6.3d: at 672 MiB a table whose writers' room is their claim (384 one-byte columns)
 /// gets no more than its room: its row groups stop at the writers' heap, short of the sink's
 /// target, and the run stays under its ceiling.
