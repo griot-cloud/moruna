@@ -13,6 +13,8 @@ moruna-loader.workspace = true
 moruna-handles.workspace = true
 moruna-quota.workspace = true
 moruna-datapath.workspace = true
+# The scheduler's policy, tested on the host; sched.rs is its adapter to OSTD (item 1.11e).
+moruna-sched.workspace = true
 # The free memory the frame allocator holds at boot: the machine's account is sized from
 # it (SDD 20 f.18).
 osdk-frame-allocator.workspace = true

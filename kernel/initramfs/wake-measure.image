@@ -1,0 +1,9 @@
+# Item 1.11e, the measurement alone (kernel/programs/src/bin/wake-measure.rs): the time from a
+# wake to the woken thread's run, on a quiet machine, with every CPU computing and with every
+# CPU but one computing. Booted by itself with 4 CPUs, so nothing else runs beside it; not
+# part of the CI boot, and it judges nothing.
+moruna-image 1
+process wake-measure
+  handle console console
+  expect wake-measure: done
+  exits 0

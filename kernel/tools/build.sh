@@ -133,6 +133,8 @@ cp "${CARGO_TARGET_DIR:-$kernel/target}/core/bin/libc-tests" "$bin/libc-tests"
 rm -rf "$out"
 mkdir -p "$out"
 cp "$bin/deadline" "$out/deadline"
+# Item 1.11e: the wake latency test, which wake-boot.sh boots alone (initramfs/wake.image).
+cp "$bin/wake" "$out/wake"
 # The layer disks are the host writer's (moruna-image, the root workspace, on its own
 # toolchain); the boot description gives their lists as `data:` handles.
 (cd "$kernel/.." && cargo run --quiet --release --locked -p moruna-image --features testing \

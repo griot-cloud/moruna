@@ -222,4 +222,9 @@ impl RingCalls for Kernel {
     fn now(&mut self) -> u64 {
         moruna_sys::now()
     }
+
+    /// The clock page, mapped at the first read: no call at each post (item 6.3p).
+    fn clock(&mut self) -> Option<u64> {
+        moruna_sys::datapath::clock_now()
+    }
 }

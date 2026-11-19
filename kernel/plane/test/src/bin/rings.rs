@@ -162,6 +162,10 @@ impl RingCalls for Counted {
         self.calls += 1;
         Kernel.now()
     }
+    /// The clock page, read with no call (6.3p's rule (d)).
+    fn clock(&mut self) -> Option<u64> {
+        Kernel.clock()
+    }
     fn revokes(&mut self, slot: &Slot) -> bool {
         Kernel.revokes(slot)
     }
@@ -570,12 +574,19 @@ fn lockstep(r: &mut Run) -> Result<(), String> {
     r.start("ring-lockstep", 4 * MIB, 4)?;
     let calls0 = calls(&mut r.plane);
     let c0 = r.plane.counters();
+    // Each batch's time from the start of its post to its record: what a lone batch, one post
+    // and then its answer awaited, costs (6.3p: lingering must cost it nothing). Timed from the
+    // post's start, so a wake at the post and one as the engine blocks are timed alike.
+    let mut took = Vec::with_capacity(LOCKSTEP as usize);
     for n in 0..LOCKSTEP {
+        let posted = moruna_svc::now();
         r.post(n)?;
         let out = r.record()?;
+        took.push(moruna_svc::now().saturating_sub(posted));
         r.judge(out, n)?;
         r.plane.drop_batch(out).map_err(plane_error)?;
     }
+    took.sort_unstable();
     let spent = calls(&mut r.plane) - calls0;
     let c = r.plane.counters();
     let (copies, sleeps, wakes) = r.wind_up()?;
@@ -602,7 +613,7 @@ fn lockstep(r: &mut Run) -> Result<(), String> {
     }
     println!(
         r.out,
-        "DS-P lockstep: ok: {} batches of {} rows, one at a time, each made in the task's region and read in place, y = 3x + 7 judged on every row, and the task said exit code 0 on its rings and its one log line on its log ring: engine {} calls a batch ({} revokes, {} regrants, {} sleeps on its bell, {} wakes of the task); task {} calls a batch ({} sleeps, {} wakes); the kernel copied {} bytes for the task, its bells' words",
+        "DS-P lockstep: ok: {} batches of {} rows, one at a time, each made in the task's region and read in place, y = 3x + 7 judged on every row, and the task said exit code 0 on its rings and its one log line on its log ring: engine {} calls a batch ({} revokes, {} regrants, {} sleeps on its bell, {} wakes of the task, {} of them as it blocked); task {} calls a batch ({} waits, {} wakes); the kernel copied {} bytes for the task, its bells' words; a batch's post, from its start, to its record {} us at the median, {} us at least, {} us at most",
         LOCKSTEP,
         ROWS,
         ratio(spent, LOCKSTEP),
@@ -610,10 +621,14 @@ fn lockstep(r: &mut Run) -> Result<(), String> {
         c.regrants - c0.regrants,
         c.bell_sleeps - c0.bell_sleeps,
         c.bells - c0.bells,
+        c.flushes - c0.flushes,
         ratio(sleeps + wakes, LOCKSTEP),
         sleeps,
         wakes,
-        copies
+        copies,
+        took[took.len() / 2] / 1000,
+        took[0] / 1000,
+        took[took.len() - 1] / 1000
     );
     Ok(())
 }
@@ -628,12 +643,19 @@ fn steady(r: &mut Run) -> Result<BatchId, String> {
     let mut first_group = 0;
     let c0 = r.plane.counters();
     let calls0 = calls(&mut r.plane);
+    // The time the engine took to post each group after the first: the interval a lingering task
+    // measures between posts (6.3p: it lingers when two of them fit in `ring::LINGER_MAX_NS`).
+    let mut posting = 0u64;
     for g in 0..GROUPS {
         if g == 1 {
             first_group = calls(&mut r.plane) - calls0;
         }
+        let began = moruna_svc::now();
         for i in 0..GROUP {
             r.post(g * GROUP + i)?;
+        }
+        if g > 0 {
+            posting += moruna_svc::now().saturating_sub(began);
         }
         for i in 0..GROUP {
             let out = r.record()?;
@@ -653,7 +675,7 @@ fn steady(r: &mut Run) -> Result<BatchId, String> {
     let (copies, sleeps, wakes) = r.wind_up()?;
     println!(
         r.out,
-        "DS-P steady: ok: {} batches of {} rows in groups of {} in flight, y = 3x + 7 judged on every row: engine {} calls a batch in the steady state ({} calls for {} batches after the first group; {} revokes and {} regrants in all); task {} calls a batch ({} sleeps, {} wakes); the kernel copied {} bytes for the task, its bells' words",
+        "DS-P steady: ok: {} batches of {} rows in groups of {} in flight, y = 3x + 7 judged on every row: engine {} calls a batch in the steady state ({} calls for {} batches after the first group; {} revokes and {} regrants in all; {} wakes of the task, {} of them as it blocked and {} at a group's deadline, and {} posts that woke no one; a post every {} us); task {} calls a batch ({} waits, {} wakes); the kernel copied {} bytes for the task, its bells' words",
         GROUPS * GROUP,
         ROWS,
         GROUP,
@@ -662,6 +684,11 @@ fn steady(r: &mut Run) -> Result<BatchId, String> {
         steady_batches,
         c.revokes - c0.revokes,
         c.regrants - c0.regrants,
+        c.bells - c0.bells,
+        c.flushes - c0.flushes,
+        c.overdue - c0.overdue,
+        c.deferred - c0.deferred,
+        posting / steady_batches / 1000,
         ratio(sleeps + wakes, GROUPS * GROUP),
         sleeps,
         wakes,

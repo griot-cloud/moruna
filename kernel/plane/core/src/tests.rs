@@ -43,7 +43,7 @@ const FRAMING: [u8; 272] = [
 ];
 
 /// The record: its framing, padded to a page, then the four values.
-fn record() -> Vec<u8> {
+pub(crate) fn record() -> Vec<u8> {
     let mut r = vec![0u8; 4096 + 32];
     r[..FRAMING.len()].copy_from_slice(&FRAMING);
     for i in 0..4u64 {

@@ -98,6 +98,10 @@ impl View for ModelMap {
 impl RingCalls for Model {
     type Mapping = ModelMap;
 
+    fn clock(&mut self) -> Option<u64> {
+        self.clock
+    }
+
     fn map(&mut self, memory: &Mem, len: u64) -> Result<ModelMap, Error> {
         self.calls += 1;
         if memory.bytes.borrow().len() < len as usize {
@@ -276,7 +280,7 @@ impl RingTaskModel {
         self.ended = Some(how);
     }
 
-    fn map(slot: &Slot) -> Option<Mem> {
+    pub(crate) fn map(slot: &Slot) -> Option<Mem> {
         let mut s = slot.borrow_mut();
         if s.current.is_none() {
             let next = s.ready.pop_front()?;

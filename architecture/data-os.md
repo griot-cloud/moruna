@@ -501,7 +501,9 @@ This is `kernel-is-the-machine.md` §4.1 and §4.2, cut to a VM with no network.
   - The engine decodes a batch straight into the input region of the task that will consume it.
     The scheduler already knows which task that is; this places the allocation, not the decision.
   - A shared ring announces the batch. The task reads the ring and the batch in place, with no
-    call, and waits on a futex only when the ring is empty.
+    call, and waits on a futex only when the ring is empty. While its engine is posting it
+    lingers for a group of posts rather than sleeping until the next one, so the plane batches
+    however promptly the task is woken (SDD 29 f.9, item 6.3p).
 - **Output.**
   - Each task has output windows mapped writable into it.
   - It writes a record as today's page-aligned Arrow record (contracts e.7) and posts it on its

@@ -1,0 +1,10 @@
+# Item 1.11e: a thread woken while another thread computes on its CPU runs within 2 ms (95 of
+# 100 wakes), with every CPU computing: woken by its timer and by another thread, on the boot
+# processor and on the last CPU (kernel/programs/src/bin/wake.rs). A latency test, so booted
+# alone by kernel/tools/wake-boot.sh, as deadline-boot.sh boots KK-T9's deadline.image, away
+# from the CI boot's runnable test threads, which its computing threads would also slow.
+moruna-image 1
+process wake
+  handle console console
+  expect wake: ok:
+  exits 0

@@ -1086,6 +1086,12 @@ fn futex(out: &Console, resource: &Handle, image: &Handle) -> Outcome {
         FUTEX_WOKEN.load(Ordering::Acquire) == 1,
         "the shared word's waiter ended without a wake",
     )?;
+    // The child writes its count after its wake, so the count is read once it has ended: the
+    // woken waiter, and this thread, may run before it does (item 1.11e).
+    call(
+        wait_one(&child.0, Signals::TERMINATED, now() + ms(10_000)),
+        "the waker did not end",
+    )?;
     let mut b = [0u8; 4];
     call(m.read(8, &mut b), "reading the waker's count")?;
     want(u32::from_le_bytes(b) == 1, "the waker woke no one")

@@ -3,6 +3,10 @@
 #![no_std]
 #![forbid(unsafe_code)]
 
+extern crate alloc;
+
+pub mod wake;
+
 use moruna_sys::{Console, exit, start};
 
 /// The exit code of a program whose manifest entry lacks a slot it needs.

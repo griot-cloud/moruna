@@ -573,6 +573,15 @@ impl Shared {
 
 /// A task's side of ring mode: its region and its rings object, each mapped once, from
 /// slots 0 and 1 of its plane.
+///
+/// With no input, the task reads its ring [`Rings::spins`] times, then waits on its bell
+/// ([`Rings::wait_input`]): it **lingers** for more while its engine is posting, until a
+/// deadline of [`ring::GROUP`] of the engine's posting intervals as the task measures them on
+/// its clock page ([`ring::Pace`]), at most [`ring::LINGER_MAX_NS`]; the engine wakes a
+/// lingering task once that many posts wait, before it blocks, and when it closes the input,
+/// not for each post. Otherwise, and once a linger ends with nothing come, it sleeps until the
+/// next post. So the task takes its batches a group at a time even when the scheduler wakes it
+/// at once (item 6.3p), and a task whose engine has stopped costs nothing.
 #[derive(Debug)]
 pub struct Rings {
     region: Shared,
@@ -583,8 +592,12 @@ pub struct Rings {
     pub spins: u32,
     /// Wakes the task called on the engine's bell.
     wakes: u64,
-    /// Sleeps it took on its own bell.
+    /// Waits it took on its own bell, lingers and sleeps: each one futex call.
     sleeps: u64,
+    /// How often the engine posts, as the task sees it.
+    pace: ring::Pace,
+    /// The task's clock.
+    clock: Clock,
     /// A batch taken while no window was free, and the part of its answer to write next.
     pending: Option<(ring::InEntry, u32)>,
 }
@@ -610,6 +623,30 @@ pub enum Step {
     NoWindow,
     /// Every batch is answered and the engine posts no more.
     Ended,
+}
+
+/// The task's clock: the clock page, read with no call, or `clock_get` where it has none.
+#[derive(Clone, Copy, Debug)]
+struct Clock(Option<crate::datapath::ClockPage>);
+
+impl Clock {
+    #[cfg(target_arch = "x86_64")]
+    fn map() -> Clock {
+        Clock(crate::datapath::ClockPage::map().ok())
+    }
+
+    #[cfg(not(target_arch = "x86_64"))]
+    fn map() -> Clock {
+        Clock(None)
+    }
+
+    fn now(&self) -> u64 {
+        match self.0 {
+            #[cfg(target_arch = "x86_64")]
+            Some(page) => page.now(),
+            _ => crate::now(),
+        }
+    }
 }
 
 /// How many times a task reads its ring before it sleeps on its bell, by default: a few
@@ -645,6 +682,8 @@ impl Rings {
         if let Some(cpu) = half.place {
             let _ = crate::datapath::pin_current_thread(Some(cpu));
         }
+        let clock = Clock::map();
+        let pace = ring::Pace::new(half.head(&rings), clock.now());
         Ok(Rings {
             region,
             rings,
@@ -652,6 +691,8 @@ impl Rings {
             spins: SPINS,
             wakes: 0,
             sleeps: 0,
+            pace,
+            clock,
             pending: None,
         })
     }
@@ -736,8 +777,9 @@ impl Rings {
         code
     }
 
-    /// Sleeps on the task's bell until the next batch or the end (the input ring is empty).
-    /// No deadline: the engine's wake reaches the bell of the shared object.
+    /// Waits on the task's bell until the next batch or the end (the input ring is empty):
+    /// lingers while the engine is posting, otherwise sleeps with no deadline, the engine's wake
+    /// reaching the bell of the shared object (see [`Rings`]).
     pub fn wait_input(&mut self) {
         for _ in 0..self.spins {
             if self.half.has_input(&self.rings) {
@@ -745,10 +787,14 @@ impl Rings {
             }
             core::hint::spin_loop();
         }
-        self.sleeps += 1;
-        self.half.sleep(&self.rings, crate::DEADLINE_INFINITE, |t| {
-            t.has_input(&self.rings)
-        });
+        let clock = self.clock;
+        let calls = self.half.wait_input(
+            &self.rings,
+            &mut self.pace,
+            || clock.now(),
+            crate::DEADLINE_INFINITE,
+        );
+        self.sleeps += u64::from(calls);
     }
 
     /// Sleeps on the task's bell until the engine gives a window (none is free).
@@ -759,10 +805,12 @@ impl Rings {
             }
             core::hint::spin_loop();
         }
-        self.sleeps += 1;
-        self.half.sleep(&self.rings, crate::DEADLINE_INFINITE, |t| {
-            t.has_window(&self.rings)
-        });
+        let slept = self.half.rest(
+            &self.rings,
+            ring::Rest::Sleep(crate::DEADLINE_INFINITE),
+            |t| t.has_window(&self.rings),
+        );
+        self.sleeps += u64::from(slept.called());
     }
 
     /// Answers the next batch: `f` reads it in place and writes a record into a free window,
@@ -853,8 +901,8 @@ impl Rings {
         }
     }
 
-    /// The task's calls on the bells so far: its sleeps, and its wakes of the engine. Each
-    /// is one futex call; nothing else of the rings makes one.
+    /// The task's calls on the bells so far: its waits (lingers and sleeps), and its wakes of
+    /// the engine. Each is one futex call; nothing else of the rings makes one.
     pub fn bell_calls(&self) -> (u64, u64) {
         (self.sleeps, self.wakes)
     }

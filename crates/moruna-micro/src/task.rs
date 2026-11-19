@@ -2463,6 +2463,10 @@ impl TaskState {
             }
         }
         debug_assert!(self.queued.is_empty(), "a unit left pieces queued");
+        // The unit returns its worker: a task asleep on pieces the plane has not woken it for
+        // (it wakes a sleeping task a group of posts at a time, item 6.3p) is woken now, so it
+        // answers them while the engine does other work.
+        self.plane.leave();
         let answer = match self.ready.len() {
             0 => {
                 let schema = self.schema.clone().ok_or_else(|| {
