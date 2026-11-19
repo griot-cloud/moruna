@@ -1469,6 +1469,7 @@ impl ImageTask {
             taking: None,
             counted: false,
             early: VecDeque::new(),
+            recent: layout::Recent::default(),
             schema: None,
             busy: Arc::clone(&self.busy),
             deferred: 0,
@@ -1552,6 +1553,8 @@ pub struct TaskState {
     counted: bool,
     /// What the task put or released while the engine laid out its next batch.
     early: VecDeque<Seen>,
+    /// Ring mode: the last things the stage saw of the task, for a failure to say (item 6.3x).
+    recent: layout::Recent,
     /// The schema of the task's answers, from its first: a batch of no rows stands for an
     /// answer still to come.
     schema: Option<moruna_kernel::arrow::datatypes::SchemaRef>,
@@ -1702,6 +1705,17 @@ enum Seen {
     /// gave the batch on its release, if it gave one (item 6.3z).
     Released(BatchId, Option<u64>),
     Ended,
+}
+
+impl Seen {
+    /// What a failure's note says of it.
+    fn saw(&self) -> layout::Saw {
+        match self {
+            Seen::Put(b) => layout::Saw::Put(b.0),
+            Seen::Released(b, _) => layout::Saw::Released(b.0),
+            Seen::Ended => layout::Saw::Ended,
+        }
+    }
 }
 
 /// An answer being taken: the batch it answers, its records taken so far (each decoded as it
@@ -1974,6 +1988,8 @@ impl TaskState {
                 .plane
                 .region_of(self.task)
                 .ok_or_else(|| kernel_error(format!("image `{}`: no input region", self.name)))?;
+            // A wait for room says where it stands as a wait for an answer does (item 6.3x).
+            let mut notes = layout::WaitNotes::begin(moruna_svc::now());
             let id = loop {
                 let laid = self.plane.load_into(region, len, |view, at| {
                     rings::write_record(view, at, len, &framing, &placed).map(|_| ())
@@ -1989,6 +2005,7 @@ impl TaskState {
                                 self.name
                             )));
                         }
+                        self.note_wait(&mut notes, layout::Waits::Region);
                     }
                     Err(e) => return Err(plane_error(&self.name, "laying the batch out", e)),
                 }
@@ -2003,6 +2020,7 @@ impl TaskState {
                                 self.name
                             )));
                         }
+                        self.note_wait(&mut notes, layout::Waits::Ring);
                     }
                     Err(e) => return Err(plane_error(&self.name, "posting the batch", e)),
                 }
@@ -2151,6 +2169,7 @@ impl TaskState {
             // 6.2 run 5, Audit at 4 instances; item 6.3r).
             Some(Event::Put { batch, .. }) if self.outstanding() > 0 => {
                 self.window = None;
+                self.recent.push(layout::Saw::Put(batch.0));
                 self.early.push_back(Seen::Put(batch));
                 Ok(true)
             }
@@ -2161,10 +2180,15 @@ impl TaskState {
             Some(Event::Released {
                 batch, piece_ns, ..
             }) if self.outstanding() > 0 => {
+                self.recent.push(layout::Saw::Released(batch.0));
                 self.early.push_back(Seen::Released(batch, piece_ns));
                 Ok(true)
             }
-            Some(Event::Released { .. } | Event::Freed { .. }) => Ok(true),
+            Some(Event::Released { batch, .. }) => {
+                self.recent.push(layout::Saw::Dropped(batch.0));
+                Ok(true)
+            }
+            Some(Event::Freed { .. }) => Ok(true),
         }
     }
 
@@ -2383,10 +2407,11 @@ impl TaskState {
         }
         let answer = match t.parts.len() {
             0 => {
-                return Err(self.failed(
+                let held = self.no_record(t.offered);
+                return Err(self.failed(&format!(
                     "it said a batch was done without a record for it: a task answers every \
-                     batch, with a record of no rows when it keeps none",
-                ));
+                     batch, with a record of no rows when it keeps none ({held})"
+                )));
             }
             1 => t
                 .parts
@@ -2624,6 +2649,7 @@ impl TaskState {
             };
             self.sent += 1;
             self.count_busy(true);
+            self.recent.push(layout::Saw::Posted(offered.0));
             self.in_flight.push_back(offered);
         }
         Ok(())
@@ -2656,6 +2682,7 @@ impl TaskState {
                 return Err(e);
             }
         };
+        self.recent.push(layout::Saw::Answered(taking.offered.0));
         // Its answer taken, the engine lets the batch's record go (ring mode).
         if self.rings {
             self.plane
@@ -2728,12 +2755,17 @@ impl TaskState {
                 None => return Ok(()),
                 Some(Event::Put { batch, .. }) => {
                     self.window = None;
+                    self.recent.push(layout::Saw::Put(batch.0));
                     self.early.push_back(Seen::Put(batch));
                 }
                 Some(Event::Released {
                     batch, piece_ns, ..
-                }) => self.early.push_back(Seen::Released(batch, piece_ns)),
+                }) => {
+                    self.recent.push(layout::Saw::Released(batch.0));
+                    self.early.push_back(Seen::Released(batch, piece_ns));
+                }
                 Some(Event::Ended { .. }) => {
+                    self.recent.push(layout::Saw::Ended);
                     self.early.push_back(Seen::Ended);
                     return Ok(());
                 }
@@ -2813,6 +2845,7 @@ impl TaskState {
             match event {
                 Some(Event::Put { batch, .. }) => {
                     self.window = None;
+                    self.recent.push(layout::Saw::Put(batch.0));
                     return Ok(Seen::Put(batch));
                 }
                 Some(Event::Refused { reason, .. }) => {
@@ -2825,10 +2858,16 @@ impl TaskState {
                     port,
                     request,
                 }) => self.call(ports, names, call, port, request)?,
-                Some(Event::Ended { .. }) => return Ok(Seen::Ended),
+                Some(Event::Ended { .. }) => {
+                    self.recent.push(layout::Saw::Ended);
+                    return Ok(Seen::Ended);
+                }
                 Some(Event::Released {
                     batch, piece_ns, ..
-                }) => return Ok(Seen::Released(batch, piece_ns)),
+                }) => {
+                    self.recent.push(layout::Saw::Released(batch.0));
+                    return Ok(Seen::Released(batch, piece_ns));
+                }
                 Some(Event::Freed { .. }) => {}
                 None => {
                     if self.cancelled() {
@@ -2850,23 +2889,45 @@ impl TaskState {
                         }
                         _ => {}
                     }
-                    if let Some(waited) = notes.due(moruna_svc::now()) {
-                        self.say_waiting(waited);
-                    }
+                    self.note_wait(&mut notes, layout::Waits::Answer);
                 }
             }
         }
     }
 
-    /// One line, every [`layout::WAIT_NOTE_NS`] of a wait with no answer come: the stage, the
-    /// task, what the stage holds of it, and each of its windows as the plane has it. To the
+    /// What the stage holds of the task, and what it saw last, when the task released `batch`
+    /// with no record for it (item 6.3x): [`layout::no_record_note`].
+    fn no_record(&self, batch: BatchId) -> String {
+        let windows = self.plane.window_states(self.task);
+        let in_flight: Vec<u64> = self.in_flight.iter().map(|b| b.0).collect();
+        let early: Vec<layout::Saw> = self.early.iter().map(Seen::saw).collect();
+        layout::no_record_note(
+            batch.0,
+            &in_flight,
+            self.taking.as_ref().map(|t| (t.offered.0, t.parts.len())),
+            &early,
+            windows.as_deref(),
+            &self.recent,
+        )
+    }
+
+    /// [`Self::say_waiting`] when `notes` says the wait is due to.
+    fn note_wait(&mut self, notes: &mut layout::WaitNotes, waits: layout::Waits) {
+        if let Some(waited) = notes.due(moruna_svc::now()) {
+            self.say_waiting(waited, waits);
+        }
+    }
+
+    /// One line, every [`layout::WAIT_NOTE_NS`] of a wait: the stage, the task, what it waits
+    /// for, what the stage holds of it, and each of its windows as the plane has it. To the
     /// engine's log and the stage's output, which the run's events carry.
-    fn say_waiting(&mut self, waited: u64) {
+    fn say_waiting(&mut self, waited: u64, waits: layout::Waits) {
         let windows = self.plane.window_states(self.task);
         let line = layout::wait_note(
             &self.name,
             self.instance,
             waited,
+            waits,
             (self.outstanding(), self.queued.len(), self.held),
             windows.as_deref(),
         );
@@ -3064,7 +3125,10 @@ impl Kernel for ImageTask {
                     };
                     Err(st.failed(&cause))
                 }
-                Seen::Released(..) => Err(st.failed("it released a batch it was not sent")),
+                Seen::Released(b, _) => {
+                    let held = st.no_record(b);
+                    Err(st.failed(&format!("it released a batch it was not sent ({held})")))
+                }
                 Seen::Ended => match st.answer(END_SECONDS * SECONDS) {
                     Some(Ok(e)) if e.how == how::EXITED && e.code == 0 => {
                         let (served, refused) = (e.served, e.refused.clone());
