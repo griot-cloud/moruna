@@ -360,3 +360,28 @@ written.
   - reads in flight sized by the store's rate and the arena's room, not by the worker count;
   - more parts in flight per upload;
   - TCP buffers at the bandwidth-delay product, if the round trip stays long.
+
+### Run 202611190506, the node alone at 15a67df7 (PM, 2026-11-19)
+
+Run 6's image plus 1.11e, a wake that preempts a busy CPU after 500 µs, and 6.3p's rule d. Gate
+tasks are built at 1fceede8, as in run 6.
+
+| Job | Runs | Run 7 (s) | Run 6 (s) | 0.6.6 Rust (s) |
+|---|---|---|---|---:|
+| Score | 6 of 6 | 54.4, 54.7, 54.6, 55.1, 54.3, 54.9 | 57.0–67.3, slower every run | 30.5 |
+| Occupancy | 6 of 6 | 16.2, 16.2, 16.2, 16.3, 16.4, 16.4 | 16.8–19.2, 4 of 6 | 11.4 |
+| Enrich | 6 of 6 | 60.0, 72.9, 75.2, 69.5, 64.7, 65.6 | 71.5–81.5 | 18.1 |
+| Audit | 6 of 6 | 17.6, 17.8, 17.9, 18.2, 17.8, 18.4 | 19.3–19.8, 4 of 6 | 12.7 |
+
+- **Every job completed: 6.3x's stall did not happen in 12 Occupancy and Audit runs.** 6.3p moved
+  the engine's flush before it reads the slots, and a task still marked waiting there had its port
+  read. That may be what closes it. The item stays open until run 8 shows the same.
+- **1.11e reached the network path.** With every CPU computing, Score's reads went from 3.1–4.6 to
+  12–18 MB/s a request, and its run no longer slows from one run to the next. Occupancy's and
+  Audit's went from 15–30 to 23–28 MB/s.
+- **One request still runs at about 25 MB/s with the CPUs free, so the in-flight count is the
+  lever (6.3y, in run 8).**
+  - Score is now mostly compute: 39 s Compute, 15 s Idle and 0.3 s IoRead of 54 s. It decodes
+    for 30 s and encodes for 23 s, summed over the workers, beside its function's tasks on the
+    same 4 CPUs.
+  - Its gap to 0.6.6 is decode, encode and the function, where the MLP kernel (4.6) applies.
