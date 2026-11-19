@@ -385,3 +385,36 @@ tasks are built at 1fceede8, as in run 6.
     for 30 s and encodes for 23 s, summed over the workers, beside its function's tasks on the
     same 4 CPUs.
   - Its gap to 0.6.6 is decode, encode and the function, where the MLP kernel (4.6) applies.
+
+### Run 202611190617, run 8b: the node alone at bench/run8b (PM, 2026-11-19)
+
+Run 7's image plus 6.3y (the request budget, 5 MiB parts, read-ahead by the room), and be2ad8ac,
+which lets the network server hold a TLS socket for every socket its grants allow. Gate tasks are
+built at 1fceede8.
+
+Run 8, at 6.3y alone, was stopped. Every Score run's upload was refused: "the network server
+answered Remote(TooMany)". The server held 16 TLS sockets in all while granting a job 64, and the
+request budget reached the seventeenth.
+
+| Job | Runs | Run 8b (s) | Run 7 (s) | 0.6.6 Rust (s) |
+|---|---|---|---|---:|
+| Score | 6 of 6 | 49.5, 48.6, 49.7, 49.2, 50.0, 49.5 | 54.3–55.1 | 30.5 |
+| Occupancy | 6 of 6 | 16.1, 16.8, 16.8, 16.8, 16.5, 16.0 | 16.2–16.4 | 11.4 |
+| Enrich | 6 of 6 | 53.7, 60.4, 61.8, 59.8, 58.1, 57.5 | 60.0–75.2 | 18.1 |
+| Audit | 6 of 6 | 17.1, 17.7, 17.3, 17.0, 16.8, 16.9 | 17.6–18.4 | 12.7 |
+
+- **The jobs that write faster gained.**
+  - Score is about 10% faster.
+  - Enrich's median is about 9% faster: 59 s against 67.5 s.
+  - Each file goes up in parts in parallel: Enrich's 23 files went in 240 parts at 8.6 MB/s a part,
+    against 38–67 parts at about 6 MB/s.
+  - Audit gained 4%.
+- **Occupancy did not move, because the node reads at about 55 MB/s in all.**
+  - About 11 reads are in flight, against about 2.4 in run 7, but each now runs at 4.7–6.2 MB/s
+    against 23–28.
+  - Linux on the same size reads at about 300 MB/s.
+  - The cap is the node's network path, wherever it is, and nothing on the node reports it yet.
+    That is item 6.3ab.
+- **6.3x's stall did not occur in 12 Occupancy and Audit runs**, the second run in a row.
+
+The outputs' bit-for-bit check was still running when this was written.
