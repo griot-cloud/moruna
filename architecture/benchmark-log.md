@@ -490,8 +490,7 @@ Gate tasks are rebuilt at the same commit.
 | Enrich | 6 of 6 | 43.8, 48.3, 50.6, 44.1, 46.0, 44.9 | 62.8–65.5 | 53.7–61.8 (8b) | 18.1 |
 | Audit | 6 of 6 | 15.2, 15.0, 15.2, 15.1, 14.8, 16.1 | 17.8–18.6 | 16.8–17.7 (8b) | 12.7 |
 
-- **The best run on every job, every job completing.** The outputs' bit-for-bit check was still
-  running when this was written (3 of 24 checked, all bit for bit).
+- **The best run on every job, and every output bit for bit (24 of 24).**
   - Medians against run 10: Score −11%, Occupancy −19%, Enrich −29%, Audit −17%.
   - Against 0.6.6's Rust function: Score 0.63×, Occupancy 0.78×, Enrich 0.40×, Audit 0.84×.
 - **6.3ad's copy fix.**
