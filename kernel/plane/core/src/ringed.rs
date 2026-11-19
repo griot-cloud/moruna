@@ -1100,6 +1100,13 @@ impl<C: RingCalls> RingPlane<C> {
             .get(&id)
             .is_some_and(|t| t.mode == Mode::Protect && !t.refused);
         if protect {
+            // The releases read so far are known to follow every record posted before them;
+            // one read from here on may be of a batch whose record comes after this group
+            // ([`Self::emit_released`], item 6.3x).
+            let (known, flying) = self
+                .tasks
+                .get(&id)
+                .map_or((0, 0), |t| (t.releases, t.inflight.len()));
             match self.posted_group(id) {
                 Ok(group) if !group.is_empty() => {
                     let t = self.tasks.get(&id).ok_or(PlaneError::Unknown("task"))?;
@@ -1125,11 +1132,16 @@ impl<C: RingCalls> RingPlane<C> {
                 Ok(_) => {}
                 Err(reason) => self.refuse(id, reason)?,
             }
-            self.emit_released(id)?;
+            // Those given ahead of the group's records were the oldest.
+            let ahead = self
+                .tasks
+                .get(&id)
+                .map_or(0, |t| flying.saturating_sub(t.inflight.len()));
+            self.emit_released(id, known.saturating_sub(ahead as u64))?;
         } else if self.records_taken(id) {
             // Unmap mode: the records come with the rings object's hand-back, so a release
             // waits for it unless nothing is posted on the current object.
-            self.emit_released(id)?;
+            self.emit_released(id, u64::MAX)?;
         }
         self.settle_ring();
         let low = self.tasks.get(&id).is_some_and(|t| {
@@ -1205,12 +1217,27 @@ impl<C: RingCalls> RingPlane<C> {
         }
     }
 
-    /// Gives the releases read so far as `Released` events, oldest first.
-    fn emit_released(&mut self, id: u32) -> Result<(), PlaneError> {
-        let n = self
-            .tasks
-            .get_mut(&id)
-            .map_or(0, |t| core::mem::take(&mut t.releases));
+    /// Gives at most `known` of the releases read and not yet given as `Released` events,
+    /// oldest first; the rest wait for a later look.
+    ///
+    /// **The engine gives a task's release only after every record the task put before it**
+    /// (SDD 29 DP-I10, item 6.3x). A release read before the engine read the records is known to
+    /// follow them, and so is one [`Self::release_ahead_of`] gives ahead of a record it took. One
+    /// read after them is not: in protect mode `release_ahead_of` reads the releases again after
+    /// the group was read, and a batch the task answered and released while the engine revoked
+    /// the group (a TLB shootdown, long enough under the emulator for a fast function's whole
+    /// piece) had its release read there and its record posted after the group. Given at once,
+    /// the ring stage saw that batch done with no record (runs 6 and 10). So `pump` gives only
+    /// the releases read before the group, less those given ahead of its records, and a release
+    /// read later waits one look, for the next [`Self::posted_group`]. In unmap mode a release
+    /// waits for the hand-back unless nothing is posted on the current object
+    /// ([`Self::records_taken`]), and a hand-back takes the records it holds first.
+    fn emit_released(&mut self, id: u32, known: u64) -> Result<(), PlaneError> {
+        let n = self.tasks.get_mut(&id).map_or(0, |t| {
+            let n = t.releases.min(known);
+            t.releases -= n;
+            n
+        });
         for _ in 0..n {
             self.release_one(id)?;
         }
@@ -1314,9 +1341,10 @@ impl<C: RingCalls> RingPlane<C> {
             Ok(group) => self.take_records(id, key, &group)?,
             Err(reason) => self.refuse(id, reason)?,
         }
-        // Every release read so far, after the records: the input ring is carried over below
-        // from what is still in flight.
-        self.emit_released(id)?;
+        // Every release read so far, after the records: the task can write neither the object
+        // nor its releases once it handed it back, so none follows a record not taken. The
+        // input ring is carried over below from what is still in flight.
+        self.emit_released(id, u64::MAX)?;
         // A task ending in unmap mode hands its last object back with its exit code on it.
         if let Some(code) = self.exit_code(TaskId(id)) {
             self.exits.insert(id, code);

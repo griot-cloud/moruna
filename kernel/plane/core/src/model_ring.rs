@@ -141,6 +141,12 @@ impl RingCalls for Model {
                 }
             }
         }
+        drop(s);
+        // The task on its own CPU while the call is under way: on the kernel a revoke is a page
+        // table change and a TLB shootdown, long enough under the emulator for a whole piece.
+        if let Some(beside) = self.during_protect.clone() {
+            (beside.0)();
+        }
         Ok(())
     }
 }
@@ -222,6 +228,10 @@ pub struct RingTaskModel {
     bell: Option<u32>,
     /// Wakes it called on the engine's bell.
     pub engine_wakes: u64,
+    /// Unmap mode: out of input, it keeps its rings object with the records it posted on it,
+    /// neither handing it back nor waiting, as a task still at work on something else does
+    /// (item 6.3x).
+    pub keeps: bool,
 }
 
 impl RingTaskModel {
@@ -248,6 +258,7 @@ impl RingTaskModel {
             bells: true,
             bell: None,
             engine_wakes: 0,
+            keeps: false,
         }
     }
 
@@ -449,6 +460,9 @@ impl RingTaskModel {
                             return true;
                         }
                         if ring.mode == Mode::Unmap && self.posted_since_put > 0 {
+                            if self.keeps {
+                                return did;
+                            }
                             self.hand_back();
                             return true;
                         }

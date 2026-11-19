@@ -654,21 +654,186 @@ impl WaitNotes {
     }
 }
 
-/// The line a stage writes while it waits on its task with no answer come: the stage, the
-/// task (its instance), how long, what the stage holds of the task's, and each of the task's
-/// windows as the plane has it (`given`, `held`, `idle`, `fresh`).
+/// What a stage waits on its task for, as its wait note says it ([`wait_note`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Waits {
+    /// An answer, or a part of one.
+    Answer,
+    /// Room in the task's input region for the next piece: a release (item 6.3x).
+    Region,
+    /// Room on the task's input ring for the next piece: a release (item 6.3x).
+    Ring,
+}
+
+impl Waits {
+    fn says(self) -> &'static str {
+        match self {
+            Waits::Answer => "for its answer with none come",
+            Waits::Region => "for room in its input region for its next piece",
+            Waits::Ring => "for room on its input ring for its next piece",
+        }
+    }
+}
+
+/// The line a stage writes while it waits on its task with nothing come: the stage, the task
+/// (its instance), how long, what for, what the stage holds of the task's, and each of the
+/// task's windows as the plane has it (`given`, `held`, `idle`, `fresh`).
 pub fn wait_note(
     stage: &str,
     task: usize,
     waited_s: u64,
+    waits: Waits,
     (in_flight, queued, held): (usize, usize, u64),
     windows: Option<&[&str]>,
 ) -> String {
     format!(
-        "image `{stage}` task {task}: waited {waited_s} s for its answer with none come; \
-         {in_flight} batches in flight, {queued} pieces queued, {held} records kept in place; \
-         its windows: {}",
-        windows.map_or_else(|| String::from("not a ring task's"), |w| w.join(", "))
+        "image `{stage}` task {task}: waited {waited_s} s {}; {in_flight} batches in flight, \
+         {queued} pieces queued, {held} records kept in place; its windows: {}",
+        waits.says(),
+        windows_said(windows)
+    )
+}
+
+fn windows_said(windows: Option<&[&str]>) -> String {
+    windows.map_or_else(|| String::from("not a ring task's"), |w| w.join(", "))
+}
+
+/// Why a stage fails on its task, which decides whether it waits for the task's end
+/// ([`failing`], item 6.3x).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Failure {
+    /// The task ended, or said it did: how it ended is read, within the bound of a task's end.
+    Ended,
+    /// The task broke the protocol and may still be running: it is ended at once, as a cancel
+    /// ends it, and its end is not waited for.
+    Violation,
+}
+
+/// A task a stage fails on ([`failing`]).
+pub trait Failing {
+    /// How the task ended, as the stage reads it.
+    type How;
+    /// Takes what the task has written by now, without waiting for more.
+    fn drain(&mut self);
+    /// Ends the task now, without waiting for its end.
+    fn end_now(&mut self);
+    /// How the task ended, waiting up to `wait_ns` nanoseconds for its answer.
+    fn how(&mut self, wait_ns: u64) -> Self::How;
+}
+
+/// What a stage does with its task as it fails on it, and how the task ended, if it waited.
+///
+/// - [`Failure::Ended`]: the task's answer, read within `end_ns`; an ended task's comes at once.
+/// - [`Failure::Violation`]: the task ended at once and no answer waited for, so the failure's
+///   time is the violation's own. The stage used to wait `end_ns` (60 s) for the end of a task
+///   whose input was still open, which never came: every failure of item 6.3x came 60 s after
+///   its violation, and read as a stall.
+///
+/// Either way it takes what the task wrote, before and after, waiting for nothing more.
+pub fn failing<T: Failing>(task: &mut T, failure: Failure, end_ns: u64) -> Option<T::How> {
+    task.drain();
+    let how = match failure {
+        Failure::Ended => Some(task.how(end_ns)),
+        Failure::Violation => {
+            task.end_now();
+            None
+        }
+    };
+    task.drain();
+    how
+}
+
+/// What a ring stage saw of its task, kept for a failure to say ([`Recent`], item 6.3x). Each
+/// names the engine's batch: an input posted, or a record put.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Saw {
+    /// The stage posted the task input batch `0`.
+    Posted(u64),
+    /// The task put record `0`.
+    Put(u64),
+    /// The task released input batch `0`.
+    Released(u64),
+    /// The task released input batch `0` with nothing outstanding, and the stage let it go.
+    Dropped(u64),
+    /// The stage took its answer to input batch `0` in full.
+    Answered(u64),
+    /// The task ended.
+    Ended,
+}
+
+impl std::fmt::Display for Saw {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Saw::Posted(b) => write!(f, "posted {b}"),
+            Saw::Put(b) => write!(f, "put {b}"),
+            Saw::Released(b) => write!(f, "released {b}"),
+            Saw::Dropped(b) => write!(f, "released {b} with none outstanding, let go"),
+            Saw::Answered(b) => write!(f, "answered {b}"),
+            Saw::Ended => f.write_str("ended"),
+        }
+    }
+}
+
+/// How many of the things a stage saw of its task a failure quotes.
+pub const RECENT: usize = 24;
+
+/// The last [`RECENT`] things a ring stage saw of its task, oldest first.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct Recent(std::collections::VecDeque<Saw>);
+
+impl Recent {
+    /// `saw` happened: the oldest goes once [`RECENT`] are kept.
+    pub fn push(&mut self, saw: Saw) {
+        if self.0.len() == RECENT {
+            self.0.pop_front();
+        }
+        self.0.push_back(saw);
+    }
+
+    /// What it kept, oldest first.
+    pub fn said(&self) -> String {
+        said(self.0.iter())
+    }
+}
+
+fn said<'a>(saw: impl Iterator<Item = &'a Saw>) -> String {
+    let all: Vec<String> = saw.map(Saw::to_string).collect();
+    if all.is_empty() {
+        String::from("none")
+    } else {
+        all.join(", ")
+    }
+}
+
+/// What a ring stage held of its task when the task released a batch it had put no record for
+/// (item 6.3x): the batch; the batches in flight behind it, oldest first; the answer being
+/// taken besides, if any (its batch and its parts so far); what the stage read ahead of
+/// taking it (`early`); the task's windows as the plane has them; and the last things the
+/// stage saw of the task ([`Recent`]).
+pub fn no_record_note(
+    batch: u64,
+    in_flight: &[u64],
+    taking: Option<(u64, usize)>,
+    early: &[Saw],
+    windows: Option<&[&str]>,
+    recent: &Recent,
+) -> String {
+    let flight: Vec<String> = in_flight.iter().map(u64::to_string).collect();
+    format!(
+        "batch {batch} released with no record; in flight behind it: {}; taking: {}; \
+         early: {}; its windows: {}; the last it saw: {}",
+        if flight.is_empty() {
+            String::from("none")
+        } else {
+            flight.join(", ")
+        },
+        taking.map_or_else(
+            || String::from("none"),
+            |(b, parts)| format!("batch {b}, {parts} records")
+        ),
+        said(early.iter()),
+        windows_said(windows),
+        recent.said()
     )
 }
 
@@ -1477,13 +1642,157 @@ mod tests {
         let mut late = WaitNotes::begin(0);
         assert_eq!(late.due(1000 * S), Some(1000));
         assert_eq!(late.due(1001 * S), None);
-        let line = wait_note("score", 3, 120, (2, 1, 2), Some(&["held", "held", "idle"]));
+        let line = wait_note(
+            "score",
+            3,
+            120,
+            Waits::Answer,
+            (2, 1, 2),
+            Some(&["held", "held", "idle"]),
+        );
         assert_eq!(
             line,
             "image `score` task 3: waited 120 s for its answer with none come; 2 batches in \
              flight, 1 pieces queued, 2 records kept in place; its windows: held, held, idle"
         );
-        assert!(wait_note("s", 0, 60, (0, 0, 0), None).ends_with("its windows: not a ring task's"));
+        assert!(
+            wait_note("s", 0, 60, Waits::Answer, (0, 0, 0), None)
+                .ends_with("its windows: not a ring task's")
+        );
+    }
+
+    #[test]
+    fn x63_a_wait_for_room_says_what_it_waits_for() {
+        let region = wait_note("audit", 1, 60, Waits::Region, (3, 2, 1), Some(&["given"]));
+        assert_eq!(
+            region,
+            "image `audit` task 1: waited 60 s for room in its input region for its next piece; \
+             3 batches in flight, 2 pieces queued, 1 records kept in place; its windows: given"
+        );
+        let ring = wait_note("audit", 1, 120, Waits::Ring, (3, 0, 0), None);
+        assert!(ring.contains("waited 120 s for room on its input ring for its next piece"));
+    }
+
+    #[test]
+    fn x63_a_release_with_no_record_says_what_the_stage_held_and_saw() {
+        let mut recent = Recent::default();
+        assert_eq!(recent.said(), "none");
+        for saw in [
+            Saw::Posted(7),
+            Saw::Put(40),
+            Saw::Released(7),
+            Saw::Answered(7),
+            Saw::Released(8),
+            Saw::Dropped(9),
+            Saw::Ended,
+        ] {
+            recent.push(saw);
+        }
+        assert_eq!(
+            recent.said(),
+            "posted 7, put 40, released 7, answered 7, released 8, released 9 with none \
+             outstanding, let go, ended"
+        );
+        let line = no_record_note(
+            8,
+            &[9, 10],
+            Some((11, 2)),
+            &[Saw::Put(41)],
+            Some(&["held", "given", "idle"]),
+            &recent,
+        );
+        assert_eq!(
+            line,
+            "batch 8 released with no record; in flight behind it: 9, 10; taking: batch 11, 2 \
+             records; early: put 41; its windows: held, given, idle; the last it saw: posted 7, \
+             put 40, released 7, answered 7, released 8, released 9 with none outstanding, let \
+             go, ended"
+        );
+        let bare = no_record_note(8, &[], None, &[], None, &Recent::default());
+        assert_eq!(
+            bare,
+            "batch 8 released with no record; in flight behind it: none; taking: none; early: \
+             none; its windows: not a ring task's; the last it saw: none"
+        );
+    }
+
+    /// A task as a stage fails on it: one still running answers nothing, so a wait for its
+    /// answer lasts to the deadline; one that ended answers at once.
+    struct Task {
+        running: bool,
+        drains: u32,
+        ended_now: bool,
+        waited: Option<u64>,
+    }
+
+    impl Task {
+        fn new(running: bool) -> Task {
+            Task {
+                running,
+                drains: 0,
+                ended_now: false,
+                waited: None,
+            }
+        }
+    }
+
+    impl Failing for Task {
+        type How = Option<&'static str>;
+        fn drain(&mut self) {
+            self.drains += 1;
+        }
+        fn end_now(&mut self) {
+            self.ended_now = true;
+            self.running = false;
+        }
+        fn how(&mut self, wait_ns: u64) -> Option<&'static str> {
+            self.waited = Some(wait_ns);
+            if self.running {
+                std::thread::sleep(std::time::Duration::from_nanos(wait_ns));
+                return None;
+            }
+            Some("exited 0")
+        }
+    }
+
+    #[test]
+    fn x63_a_violation_fails_the_stage_well_within_a_second() {
+        const END_NS: u64 = 60 * 1_000_000_000;
+        let started = std::time::Instant::now();
+        let mut live = Task::new(true);
+        assert_eq!(failing(&mut live, Failure::Violation, END_NS), None);
+        let took = started.elapsed();
+        assert!(
+            took < std::time::Duration::from_millis(100),
+            "a violation waited {took:?}"
+        );
+        assert!(live.ended_now, "the task is ended at once");
+        assert_eq!(live.waited, None, "and its end is not waited for");
+        assert_eq!(live.drains, 2, "what it wrote is taken, before and after");
+    }
+
+    #[test]
+    fn x63_a_task_s_end_is_read_within_the_end_s_bound() {
+        let mut ended = Task::new(false);
+        assert_eq!(
+            failing(&mut ended, Failure::Ended, 7),
+            Some(Some("exited 0"))
+        );
+        assert_eq!(ended.waited, Some(7));
+        assert!(!ended.ended_now, "an ended task is not ended again");
+        assert_eq!(ended.drains, 2);
+    }
+
+    #[test]
+    fn x63_a_stage_keeps_the_last_of_what_it_saw_of_its_task() {
+        let mut recent = Recent::default();
+        for b in 0..(RECENT as u64 + 5) {
+            recent.push(Saw::Posted(b));
+        }
+        let said = recent.said();
+        assert!(said.starts_with("posted 5, "), "{said}");
+        assert!(said.ends_with(&format!("posted {}", RECENT + 4)), "{said}");
+        assert_eq!(said.matches("posted").count(), RECENT);
     }
 
     #[test]
