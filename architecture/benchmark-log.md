@@ -474,3 +474,34 @@ harness keeping each job's meter lines. It does not have 6.3ac (merged later).
   - 6.3w's workers.
 
   Run 11 has 6.3ac and should show where it stands.
+
+### Run 202611190853, run 11: the node alone at 7c973a96 (PM, 2026-11-19)
+
+Run 10 plus two changes:
+- **6.3ac:** the morsel search counts the whole stage's CPU per byte;
+- **6.3ad:** the network server copies in bulk and tries a receive only when it can be answered.
+
+Gate tasks are rebuilt at the same commit.
+
+| Job | Runs | Run 11 (s) | Run 10 (s) | Best before (s) | 0.6.6 Rust (s) |
+|---|---|---|---|---|---:|
+| Score | 6 of 6 | 49.3, 47.1, 46.8, 47.9, 49.6, 48.2 | 52.9–54.5 | 48.6–50.0 (8b) | 30.5 |
+| Occupancy | 6 of 6 | 14.4, 15.1, 15.2, 14.7, 14.6, 14.6 | 17.4–18.8 | 16.0–16.8 (8b) | 11.4 |
+| Enrich | 6 of 6 | 43.8, 48.3, 50.6, 44.1, 46.0, 44.9 | 62.8–65.5 | 53.7–61.8 (8b) | 18.1 |
+| Audit | 6 of 6 | 15.2, 15.0, 15.2, 15.1, 14.8, 16.1 | 17.8–18.6 | 16.8–17.7 (8b) | 12.7 |
+
+- **The best run on every job, and every output bit for bit (24 of 24).**
+  - Medians against run 10: Score −11%, Occupancy −19%, Enrich −29%, Audit −17%.
+  - Against 0.6.6's Rust function: Score 0.63×, Occupancy 0.78×, Enrich 0.40×, Audit 0.84×.
+- **6.3ad's copy fix.**
+  - The network server handed its clients 9.71 GB in 9.1 s of copying, about 1 GB/s, against
+    58 MB/s.
+  - Every receive tried was answered: 274,431 of 274,461.
+  - Its CPU fell to 104 s by the node's 470th second, against 126 s by the 405th.
+- **6.3ac.** The search settled Occupancy at 8 MiB on the whole stage's cost: the function's 2.06
+  and the engine's 2.89 ns a byte.
+- **The next network cap is the card link.**
+  - Each netvsc answer to the network server carries about 34 frames.
+  - 65% of answers leave frames queued (154,399 of 238,105).
+  - 34,773 frames were dropped (0.43%), each a TCP retransmit.
+  - A read still averages about 7 MB/s a request.
