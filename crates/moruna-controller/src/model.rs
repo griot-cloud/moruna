@@ -57,6 +57,8 @@ const KERNEL_ANON_SHARE: f64 = 0.6;
 const READ_AHEAD_SHARE: f64 = 0.5;
 /// The read-ahead depth f.3 starts from (`readahead.splits`).
 const READ_AHEAD_INITIAL: u16 = 2;
+/// The read-ahead ceiling (`readahead.splits`, the preamble's range).
+pub(crate) const READ_AHEAD_MAX: u16 = 64;
 /// What the source drive charges the arena per byte a read decodes to: twice, the most a size
 /// class rounds a buffer up by (02 e.2; the scheduler's `ARENA_ROUNDING`).
 pub const READ_CHARGE: u64 = 2;
@@ -468,7 +470,7 @@ pub(crate) fn solve(state: &ControllerState) -> Solution {
         state,
         targets.first().copied().unwrap_or(state.cfg.morsel_max),
     );
-    let read_ahead = read_ahead(queue_half, split_bytes, active_workers);
+    let read_ahead = read_ahead(queue_half, split_bytes);
     let for_queues = queue_half.saturating_sub(u64::from(read_ahead).saturating_mul(split_bytes));
     let queues = state.queue_count() as u64;
     let high_water = for_queues / queues.max(1);
@@ -556,16 +558,22 @@ fn split_bytes(state: &ControllerState, first_target: u64) -> u64 {
     }
 }
 
-/// The read-ahead depth that fits in the queue half (f.3), floor 1.
-fn read_ahead(queue_half: u64, split_bytes: u64, workers: u16) -> u16 {
+/// The read-ahead depth that fits in the queue half (f.3), floor 1, at most the preamble's
+/// ceiling.
+///
+/// The room bounds it, never the workers (item 6.3y). A read in flight is a fetch: its decode
+/// runs on a worker once it lands (RB1, RB3), so the workers bound the decodes, not the fetches.
+/// A request to an object store runs at what one connection gives (run 6 on the node: 15–30 MB/s
+/// a read), so a run reads as fast as the fetches it keeps in flight; the read-ahead that followed
+/// the pool kept about 2.4 of them on a 4-CPU node while its queue held 87 MB of a 3.16 GB tier.
+/// What goes on the wire at once is the reactor's request budget's to bound.
+fn read_ahead(queue_half: u64, split_bytes: u64) -> u16 {
     if split_bytes == 0 {
         return READ_AHEAD_INITIAL;
     }
     let room = scale(queue_half, READ_AHEAD_SHARE) / split_bytes;
     let allowed = u16::try_from(room).unwrap_or(u16::MAX);
-    // RB1, RB3: the decodes of the reads in flight run on the workers, so the read-ahead may
-    // follow the pool rather than stop at a fixed two.
-    allowed.clamp(1, workers.max(READ_AHEAD_INITIAL))
+    allowed.clamp(1, READ_AHEAD_MAX)
 }
 
 /// f.3. The initial knobs, then the tick thread.
@@ -1020,5 +1028,20 @@ mod native_commitment_tests {
                 ..
             })
         ));
+    }
+
+    /// 6.3y: the read-ahead is the room's, never the pool's. A 4-worker run whose queue half
+    /// holds 64 reads at their split reads 64 ahead, where the pool's bound kept it at 4; a
+    /// room past the ceiling is held at the ceiling; a room for less than one read keeps one.
+    #[test]
+    fn the_read_ahead_follows_the_room_not_the_workers() {
+        const MIB: u64 = 1 << 20;
+        let split = 32 * MIB;
+        // Half the queue half over the split: 64 reads.
+        assert_eq!(read_ahead(2 * 64 * split, split), 64);
+        assert_eq!(read_ahead(2 * 10 * split, split), 10);
+        assert_eq!(read_ahead(2 * 500 * split, split), READ_AHEAD_MAX);
+        assert_eq!(read_ahead(split / 4, split), 1);
+        assert_eq!(read_ahead(64 * split, 0), READ_AHEAD_INITIAL);
     }
 }

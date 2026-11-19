@@ -26,8 +26,6 @@ const THROTTLE_TRIP: f64 = 0.10;
 const HIGH_WATER_SHRINK: f64 = 0.9;
 /// How much the state term must grow in one tick to count as growing (f.6).
 const STATE_GROWTH: f64 = 0.10;
-/// The read-ahead ceiling (`readahead.splits`).
-const READ_AHEAD_MAX: u16 = 64;
 /// Ticks of a rising last queue that mean the sink is behind (f.6).
 const RISING_TICKS: usize = 4;
 
@@ -326,7 +324,10 @@ fn stage_sink_queues(state: &mut ControllerState, actions: &mut Actions) {
 /// The IoRead row: another split in flight when the working set allows it, and otherwise the
 /// bytes to pay for one, taken from the queues.
 fn read_ahead_up(state: &mut ControllerState, actions: &mut Actions) {
-    let next = state.read_ahead.saturating_add(1).min(READ_AHEAD_MAX);
+    let next = state
+        .read_ahead
+        .saturating_add(1)
+        .min(model::READ_AHEAD_MAX);
     if next == state.read_ahead {
         return;
     }

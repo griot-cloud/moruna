@@ -41,12 +41,17 @@ pub const S3_PARTS_MAX: u64 = 10_000;
 ///
 /// - `requests` (N) is the room over S3's smallest part, at least one and at most the job's
 ///   socket budget (3D: `moruna_storage::net::SOCKETS`, the engine's copy of the node's
-///   `egress::SOCKETS`), so every request may carry at least a part of S3's least size.
-/// - `part_bytes` is the room over N, at least S3's smallest part: each request's share.
+///   `egress::SOCKETS`), so every request may carry at least a part of S3's least size. It is
+///   the reactor's one request budget: every request on the wire, a ranged read, a part, a put
+///   or a meta call, holds one of its N permits (item 6.3y).
+/// - `part_bytes` is S3's smallest part. The room buys parts in flight, not larger parts: one
+///   request runs at what one connection gives (run 6 on the node: 15–30 MB/s a read, about
+///   10 MB/s a write), so a part as large as the room's share made a 48 MB file one put on one
+///   connection (6.3y).
 ///
-/// An object's own part ([`ObjectIo::part_for`]) is that share, raised so the object fits in S3's
+/// An object's own part ([`ObjectIo::part_for`]) is that part, raised so the object fits in S3's
 /// most parts and capped at the object. An object of one part is one `put`; a larger one is a
-/// multipart upload with at most N of its parts in flight.
+/// multipart upload whose parts go out as the request budget has permits.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct ObjectIo {
     /// Requests to the stores at once, reads and writes together (N).
@@ -64,7 +69,7 @@ impl ObjectIo {
         let requests = (room / S3_PART_MIN_BYTES).clamp(1, sockets);
         ObjectIo {
             requests: usize::try_from(requests).unwrap_or(usize::MAX),
-            part_bytes: (room / requests).max(S3_PART_MIN_BYTES),
+            part_bytes: S3_PART_MIN_BYTES,
         }
     }
 
@@ -360,6 +365,9 @@ pub(crate) struct ObjectLayer {
     override_backend: Option<Arc<dyn ObjectBackend>>,
     /// What the run's budget lets the stores have in flight (3A, 3.5b).
     pub(crate) budget: ObjectIo,
+    /// The request budget: `budget.requests` permits, one held by every request on the wire
+    /// (6.3y). The operations' queues and a write's parts take them alike.
+    pub(crate) requests: Arc<tokio::sync::Semaphore>,
 }
 
 impl ObjectLayer {
@@ -372,12 +380,14 @@ impl ObjectLayer {
             clients: Mutex::new(HashMap::new()),
             override_backend,
             budget: ObjectIo::default(),
+            requests: Arc::new(tokio::sync::Semaphore::new(ObjectIo::default().requests)),
         }
     }
 
-    /// The same layer, its writes cut in parts as `budget` says.
+    /// The same layer, its writes cut in parts and its requests bounded as `budget` says.
     pub(crate) fn with_io(mut self, budget: ObjectIo) -> ObjectLayer {
         self.budget = budget;
+        self.requests = Arc::new(tokio::sync::Semaphore::new(budget.requests.max(1)));
         self
     }
 
@@ -686,12 +696,18 @@ fn payload_of(view: moruna_kernel::BufferView) -> PutPayload {
 }
 
 /// `write_object` (f.4): an object of one part is one `put`; a larger one is a multipart upload in
-/// the parts the budget gives it (`ObjectIo`), at most N of them in flight, and an abort of the
-/// upload on any failure. Every part is a view of the sink's arena buffer, sent as it is.
+/// the parts the budget gives it (`ObjectIo`), and an abort of the upload on any failure. Every
+/// part is a view of the sink's arena buffer, sent as it is.
+///
+/// `permit` is the request budget's permit the operation's queue took for it (6.3y). A put, the
+/// upload's start and its completion each hold one; each part takes its own before it goes out
+/// and holds it until it is answered, and the operation holds none while its parts wait for
+/// theirs, so writes and reads share the budget without one waiting on the other's permits.
 pub(crate) async fn write(
     layer: &ObjectLayer,
     url: &str,
     src: &moruna_kernel::BufferView,
+    permit: tokio::sync::OwnedSemaphorePermit,
 ) -> Result<()> {
     if src.host_ptr().is_none() {
         return Err(MorunaError::Staging(format!(
@@ -703,30 +719,47 @@ pub(crate) async fn write(
     let len = src.len();
     let budget = layer.budget;
     if budget.single_put(len as u64) {
-        return backend
+        let put = backend
             .put(&path, payload_of(src.slice(0, len)))
             .await
             .map_err(|e| io(crate::stats::OpKind::WriteObject.as_str(), url, &e));
+        drop(permit);
+        return put;
     }
     let part_bytes = usize::try_from(budget.part_for(len as u64)).unwrap_or(len);
-    let parts_in_flight = budget.parts_in_flight(len as u64);
     let mut upload = backend
         .put_multipart(&path)
         .await
         .map_err(|e| io("write_object", url, &e))?;
+    drop(permit);
     let mut in_flight: std::collections::VecDeque<
         tokio::task::JoinHandle<object_store::Result<()>>,
     > = std::collections::VecDeque::new();
     let mut offset = 0usize;
     let mut failure: Option<MorunaError> = None;
     while offset < len && failure.is_none() {
+        // A part answered already is joined now, so a failure stops the parts not yet sent.
+        while in_flight.front().is_some_and(|h| h.is_finished()) {
+            failure = join_one(&mut in_flight, url).await;
+            if failure.is_some() {
+                break;
+            }
+        }
+        if failure.is_some() {
+            break;
+        }
+        let Ok(part_permit) = Arc::clone(&layer.requests).acquire_owned().await else {
+            failure = Some(MorunaError::Cancelled);
+            break;
+        };
         let n = part_bytes.min(len - offset);
         let part = upload.part(payload_of(src.slice(offset, n)));
-        in_flight.push_back(tokio::spawn(part));
+        in_flight.push_back(tokio::spawn(async move {
+            let sent = part.await;
+            drop(part_permit);
+            sent
+        }));
         offset += n;
-        if in_flight.len() >= parts_in_flight {
-            failure = join_one(&mut in_flight, url).await;
-        }
     }
     while failure.is_none() && !in_flight.is_empty() {
         failure = join_one(&mut in_flight, url).await;
@@ -734,6 +767,10 @@ pub(crate) async fn write(
     for handle in in_flight {
         handle.abort();
     }
+    let Ok(_end) = Arc::clone(&layer.requests).acquire_owned().await else {
+        let _ = upload.abort().await;
+        return Err(failure.unwrap_or(MorunaError::Cancelled));
+    };
     if let Some(e) = failure {
         let _ = upload.abort().await;
         return Err(e);
@@ -1073,13 +1110,17 @@ mod tests {
         // Less than a part's room: still one request of a whole part.
         let thin = ObjectIo::for_room(3 * MIB, 64);
         assert_eq!((thin.requests, thin.part_bytes), (1, S3_PART_MIN_BYTES));
-        // Twenty parts' room and a little: twenty requests, each its share.
+        // Twenty parts' room and a little: twenty requests, in parts of S3's least size.
         let room = 20 * S3_PART_MIN_BYTES + 40;
         let some = ObjectIo::for_room(room, 64);
-        assert_eq!((some.requests, some.part_bytes), (20, room / 20));
-        // More room than the sockets: the sockets bound N, and the parts grow with the room.
+        assert_eq!((some.requests, some.part_bytes), (20, S3_PART_MIN_BYTES));
+        // More room than the sockets: the sockets bound N, and the parts stay at S3's least
+        // size (6.3y): room buys parts in flight, never larger parts.
         let wide = ObjectIo::for_room(4096 * MIB, 64);
-        assert_eq!((wide.requests, wide.part_bytes), (64, 64 * MIB));
+        assert_eq!((wide.requests, wide.part_bytes), (64, S3_PART_MIN_BYTES));
+        // A 48 MiB file in that budget goes up in ten parts, all in flight at once.
+        assert_eq!(wide.parts_of(48 * MIB), 10);
+        assert_eq!(wide.parts_in_flight(48 * MIB), 10);
         // A socket budget of none is read as one.
         assert_eq!(ObjectIo::for_room(4096 * MIB, 0).requests, 1);
     }

@@ -292,7 +292,14 @@ impl MultipartSink for TestUpload {
         self.seen += 1;
         let index = self.seen;
         let me = Arc::clone(&self.backend);
+        // A part is a request on the wire like a read (6.3y): counted in flight, and as slow.
+        let delay = me.sleep();
+        me.enter();
         Box::pin(async move {
+            let _guard = InFlight(Arc::clone(&me));
+            if delay > Duration::ZERO {
+                tokio::time::sleep(delay).await;
+            }
             {
                 let mut c = me.counts.lock().unwrap_or_else(|e| e.into_inner());
                 c.parts += 1;
@@ -2155,6 +2162,82 @@ fn a_multipart_write_that_succeeds_completes_the_upload() {
     let (_, parts, aborts, completes) = backend.counts();
     assert_eq!(parts, 5, "68 MiB is five 16 MiB parts");
     assert_eq!((aborts, completes), (0, 1));
+    reactor.shutdown();
+}
+
+/// 6.3y: a write's parts and the reads share one request budget. With N = 6, a 48 MiB write in
+/// parts of S3's least size (ten of them) beside twenty reads never has more than six requests on
+/// the wire, and every part and read completes.
+#[test]
+fn a_writes_parts_and_the_reads_share_one_request_budget() {
+    let alloc = FakeAllocator::new();
+    let backend = TestBackend::new();
+    let mut cfg = config(profile(Guarantee::Probed(false)));
+    cfg.object_io = ObjectIo::for_room(6 * crate::S3_PART_MIN_BYTES, 64);
+    assert_eq!(cfg.object_io.requests, 6);
+    let reactor = build(
+        cfg,
+        &alloc,
+        Hooks {
+            object_backend: Some(as_backend(&backend)),
+            ..Hooks::default()
+        },
+    );
+    let mut seed = alloc.buffer(64, Tier::Host);
+    seed.copy_from_slice(&pattern(64, 2));
+    let seed = Arc::new(seed);
+    reactor
+        .write_object("s3://bucket/seed", seed.view())
+        .wait()
+        .expect("seed");
+    backend.with_latency(Duration::from_millis(20));
+    let big = Arc::new(alloc.buffer(48 * 1024 * 1024, Tier::Host));
+    let write = reactor.write_object("s3://bucket/big", big.view());
+    let reads: Vec<_> = (0..20)
+        .map(|_| reactor.read_object("s3://bucket/seed", 0, alloc.buffer(64, Tier::Host)))
+        .collect();
+    write.wait().expect("every part is accepted");
+    for read in reads {
+        read.wait().expect("object read");
+    }
+    let (max_in_flight, parts, aborts, completes) = backend.counts();
+    assert_eq!(parts, 10, "48 MiB is ten parts of S3's least size");
+    assert_eq!((aborts, completes), (0, 1));
+    assert!(
+        max_in_flight <= 6,
+        "the backend saw {max_in_flight} requests on the wire, the budget is 6"
+    );
+    reactor.shutdown();
+}
+
+/// 6.3y: alone, with the budget's room, a 48 MiB object's ten parts are on the wire at once,
+/// where a part as large as the room's share made it one put on one connection.
+#[test]
+fn a_files_parts_go_out_at_once_when_the_budget_allows() {
+    let alloc = FakeAllocator::new();
+    let backend = TestBackend::new();
+    let mut cfg = config(profile(Guarantee::Probed(false)));
+    cfg.object_io = ObjectIo::for_room(4096 * 1024 * 1024, 64);
+    let reactor = build(
+        cfg,
+        &alloc,
+        Hooks {
+            object_backend: Some(as_backend(&backend)),
+            ..Hooks::default()
+        },
+    );
+    backend.with_latency(Duration::from_millis(50));
+    let big = Arc::new(alloc.buffer(48 * 1024 * 1024, Tier::Host));
+    reactor
+        .write_object("s3://bucket/big", big.view())
+        .wait()
+        .expect("every part is accepted");
+    let (max_in_flight, parts, _, completes) = backend.counts();
+    assert_eq!((parts, completes), (10, 1));
+    assert_eq!(
+        max_in_flight, 10,
+        "every part of the file was on the wire at once"
+    );
     reactor.shutdown();
 }
 

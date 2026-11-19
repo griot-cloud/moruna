@@ -371,7 +371,7 @@ impl Reactor {
                 },
             )
         };
-        let queues = runtime::start(&inner, cfg.object_io.requests, cfg.file_depth);
+        let queues = runtime::start(&inner, cfg.file_depth);
         Ok(Arc::new(Reactor {
             inner,
             _arena: alloc,

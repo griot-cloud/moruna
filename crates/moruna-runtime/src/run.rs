@@ -3667,15 +3667,15 @@ mod tests {
         let small = object_io_for(arena, &mut notes);
         assert_eq!(object_room(arena), 100_728_832);
         assert_eq!(small.requests, 19, "the room over S3's least part");
-        assert_eq!(small.part_bytes, 100_728_832 / 19);
-        assert!(small.part_bytes >= moruna_reactor::S3_PART_MIN_BYTES);
+        assert_eq!(small.part_bytes, moruna_reactor::S3_PART_MIN_BYTES);
         assert!(
-            notes[0].starts_with("object stores: 19 requests at once in parts of 5301517 bytes"),
+            notes[0].starts_with("object stores: 19 requests at once in parts of 5242880 bytes"),
             "{notes:?}"
         );
-        // The month's files of about 3 MB are each one put; a 64 MiB file is parts of the share.
+        // The month's files of about 3 MB are each one put; a 64 MiB file is parts of S3's least
+        // size, as many in flight as the requests allow (6.3y).
         assert!(small.single_put(3_000_000));
-        assert_eq!(small.part_for(64 * MIB), 5_301_517);
+        assert_eq!(small.part_for(64 * MIB), moruna_reactor::S3_PART_MIN_BYTES);
         assert_eq!(small.parts_in_flight(64 * MIB), 13);
 
         let (_, arena) = arena_of(14_360 * MIB);
@@ -3685,11 +3685,14 @@ mod tests {
             moruna_storage::net::SOCKETS,
             "a 16 GiB node's job reaches the socket budget"
         );
-        assert_eq!(large.part_bytes, object_room(arena) / 64);
         assert_eq!(
-            large.part_bytes, 52_435_968,
-            "the parts grow with the room: about ten times the small budget's"
+            large.part_bytes,
+            moruna_reactor::S3_PART_MIN_BYTES,
+            "the room buys parts in flight, never larger parts (6.3y)"
         );
+        // A 48 MiB file, Enrich's, goes up in ten parts at once rather than one put.
+        assert_eq!(large.parts_of(48 * MIB), 10);
+        assert_eq!(large.parts_in_flight(48 * MIB), 10);
     }
 
     fn sizing() -> Sizing {

@@ -181,9 +181,11 @@ where
 }
 
 /// Build the queues and their drain tasks.
-pub(crate) fn start(inner: &Arc<Inner>, object_concurrency: usize, file_depth: usize) -> Queues {
+pub(crate) fn start(inner: &Arc<Inner>, file_depth: usize) -> Queues {
     let files = Arc::new(Semaphore::new(file_depth.max(1)));
-    let objects = Arc::new(Semaphore::new(object_concurrency.max(1)));
+    // The request budget (6.3y): the object operations' queues take its permits, and a write's
+    // parts take theirs from it too, so no more than its N requests are on the wire.
+    let objects = Arc::clone(&inner.objects.requests);
     // Copies are limited by the CUDA stream queue and by the placement engine's reservations,
     // not by a semaphore of this component (f.6).
     let copies = Arc::new(Semaphore::new(Semaphore::MAX_PERMITS));
@@ -750,7 +752,7 @@ async fn read_object_body(
     Ok(dst)
 }
 
-async fn run_write_object(inner: Arc<Inner>, op: WriteObjectOp, _permit: OwnedSemaphorePermit) {
+async fn run_write_object(inner: Arc<Inner>, op: WriteObjectOp, permit: OwnedSemaphorePermit) {
     let WriteObjectOp { url, src, tx } = op;
     if inner.cancelled() {
         inner.resolve(tx, Err(MorunaError::Cancelled));
@@ -758,7 +760,7 @@ async fn run_write_object(inner: Arc<Inner>, op: WriteObjectOp, _permit: OwnedSe
     }
     let started = std::time::Instant::now();
     let len = src.len() as u64;
-    let result = crate::object::write(&inner.objects, &url, &src).await;
+    let result = crate::object::write(&inner.objects, &url, &src, permit).await;
     drop(src);
     if result.is_ok() {
         let parts = inner.objects.budget.parts_of(len);
