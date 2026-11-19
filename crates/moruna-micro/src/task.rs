@@ -49,7 +49,7 @@ use std::ptr::NonNull;
 use std::sync::{Arc, Mutex, OnceLock};
 
 use linux_protocol::{Bytes, Ended, Plane as LinuxPlane, how, linux};
-use moruna_adapters::{UNKNOWN_SEQ, UNKNOWN_STAGE};
+use moruna_adapters::{UNKNOWN_SEQ, UNKNOWN_STAGE, instances};
 use moruna_kernel::arrow::buffer::Buffer as ArrowBuffer;
 use moruna_kernel::ports::Answer as PortAnswer;
 use moruna_kernel::{
@@ -869,8 +869,8 @@ impl ImageTask {
 
     /// A task that passed its room, started again (system design 3A; PM, 2026-11-18): its
     /// unanswered pieces landed from the records the engine kept, oldest first; the task retired
-    /// with its account; a new one carved at twice the account (`layout::restarted_limit`, as far
-    /// as the engine's room allows); and the unit given to it as it stood, the copied pieces
+    /// with its account; a new one carved at twice the account (`instances::restarted_limit`, as
+    /// far as the engine's room allows); and the unit given to it as it stood, the copied pieces
     /// queued first and the answers already taken kept. The stage's note says it, and the old
     /// task's figures, its peak beside its largest piece, are its reading in the report. A
     /// function that keeps state is not started again (it has no checkpoint to start from), nor
@@ -889,7 +889,7 @@ impl ImageTask {
             .saturating_add(usage.limit);
         let needed = usage.peak.saturating_add(usage.refused_max);
         let margin = *lock(&self.busy.margin);
-        let Some(grown) = layout::restarted_limit(usage.limit, needed, margin, room) else {
+        let Some(grown) = instances::restarted_limit(usage.limit, needed, margin, room) else {
             return Err(cause);
         };
         let unanswered = st.unanswered()?;
@@ -1308,7 +1308,7 @@ impl ImageTask {
         let restarted = lock(&self.restarted).get(&instance).copied();
         let limit = match (restarted, *lock(&self.measured)) {
             (Some(account), _) | (None, Some((_, account))) => {
-                layout::measured_task_limit(account, room)
+                instances::measured_task_limit(account, room)
             }
             (None, None) if native => layout::native_task_limit(ceiling, room),
             (None, None) => layout::task_limit(ceiling, room),
