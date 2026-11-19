@@ -98,6 +98,10 @@ impl View for ModelMap {
 impl RingCalls for Model {
     type Mapping = ModelMap;
 
+    fn clock(&mut self) -> Option<u64> {
+        self.clock
+    }
+
     fn map(&mut self, memory: &Mem, len: u64) -> Result<ModelMap, Error> {
         self.calls += 1;
         if memory.bytes.borrow().len() < len as usize {

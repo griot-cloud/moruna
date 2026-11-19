@@ -87,6 +87,9 @@ pub struct Model {
     pub calls: u64,
     /// Futex waits and wakes the engine made on its mappings.
     pub futex: Rc<core::cell::Cell<u64>>,
+    /// The clock the engine reads with no call (`RingCalls::clock`), as a test sets it; none by
+    /// default, as an engine without a clock page.
+    pub clock: Option<u64>,
 }
 
 impl Default for Model {
@@ -101,6 +104,7 @@ impl Default for Model {
             protect: false,
             calls: 0,
             futex: Rc::new(core::cell::Cell::new(0)),
+            clock: None,
         }
     }
 }

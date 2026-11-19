@@ -167,6 +167,26 @@ impl ClockPage {
     }
 }
 
+/// The clock page's address once [`clock_now`] mapped it; 0 before, [`NO_CLOCK_PAGE`] when the
+/// kernel gave none.
+#[cfg(target_arch = "x86_64")]
+static CLOCK_PAGE_AT: AtomicU64 = AtomicU64::new(0);
+#[cfg(target_arch = "x86_64")]
+const NO_CLOCK_PAGE: u64 = u64::MAX;
+
+/// [`crate::now`]'s clock read from the clock page with no call: the page is mapped at the first
+/// read of the process (one call), and `None` where the kernel gives no page. For the engine's
+/// side of the ring plane, which reads the clock at each post (item 6.3p).
+#[cfg(target_arch = "x86_64")]
+pub fn clock_now() -> Option<u64> {
+    let mut at = CLOCK_PAGE_AT.load(Ordering::Relaxed);
+    if at == 0 {
+        at = clock_page().unwrap_or(NO_CLOCK_PAGE);
+        CLOCK_PAGE_AT.store(at, Ordering::Relaxed);
+    }
+    (at != NO_CLOCK_PAGE).then(|| ClockPage { address: at }.now())
+}
+
 /// Reads the clock page at `base`, retrying while the kernel writes it: the sequence,
 /// the fields, the sequence again, which must be the same and even.
 ///

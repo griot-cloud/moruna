@@ -49,6 +49,16 @@ const FAST_TASK: Costs = Costs {
     wake: 5 * US,
 };
 
+/// Posts too slow for a lingering task: two of them do not fit in `ring::LINGER_MAX_NS`, so the
+/// task sleeps between them, as DS-P's task did on the emulator (6.3p's first boots: posts of
+/// 5 ms and more at four CPUs, 17 ms from post to record at one).
+const SLOW_POSTS: Costs = Costs {
+    post: 6 * MS,
+    judge: 300 * US,
+    compute: 3 * MS,
+    wake: 50 * US,
+};
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Cpus {
     /// One CPU between the engine and the task: a woken task takes it at once.
@@ -67,6 +77,11 @@ enum Op {
     /// Work elsewhere for this long, calling nothing of the plane: a stage unit that posts and
     /// returns to its worker.
     Busy(u64),
+    /// Leave the plane for other work, as a stage unit that returns its worker does
+    /// (`RingPlane::leave`).
+    Leave,
+    /// Look at the plane without blocking (`next(0)`), taking what came.
+    Poll,
     /// Close the task's input.
     Close,
 }
@@ -119,6 +134,9 @@ struct Engine {
     post_times: Vec<u64>,
     /// For each record taken, the time from its batch's post to its take.
     latency: Vec<u64>,
+    /// It reads its clock with no call (rule (d): a sleeping task woken a group of posts at a
+    /// time); without one, a sleeping task is woken at each post.
+    clock: bool,
 }
 
 impl Engine {
@@ -130,8 +148,15 @@ impl Engine {
         Some(match self.ops.front()? {
             Op::Post => self.at + self.costs.post,
             Op::Busy(d) => self.at + d,
-            Op::Take | Op::Close => self.at,
+            Op::Take | Op::Leave | Op::Poll | Op::Close => self.at,
         })
+    }
+
+    /// The engine's clock as the plane reads it with no call, when the engine has one.
+    fn tick(&mut self) {
+        if self.clock {
+            self.plane.plane.calls.clock = Some(self.at);
+        }
     }
 
     fn step(&mut self) {
@@ -141,6 +166,7 @@ impl Engine {
         match op {
             Op::Post => {
                 self.at += self.costs.post;
+                self.tick();
                 let record = self.record.clone();
                 let (b, _) = self
                     .plane
@@ -154,7 +180,10 @@ impl Engine {
                 self.post_times.push(self.at);
                 self.ops.pop_front();
             }
-            Op::Take => match self.plane.next(1).expect("next") {
+            Op::Take => match {
+                self.tick();
+                self.plane.next(1).expect("next")
+            } {
                 Some(Event::Put { batch, .. }) => {
                     let posted = self.posted.pop_front().expect("a batch in flight");
                     self.latency.push(self.at - posted);
@@ -176,7 +205,24 @@ impl Engine {
                 self.at += d;
                 self.ops.pop_front();
             }
+            Op::Leave => {
+                self.tick();
+                self.plane.leave();
+                self.ops.pop_front();
+            }
+            Op::Poll => {
+                self.tick();
+                while let Some(e) = self.plane.next(0).expect("a poll") {
+                    if let Event::Put { batch, .. } = e {
+                        let posted = self.posted.pop_front().expect("a batch in flight");
+                        self.latency.push(self.at - posted);
+                        self.plane.drop_batch(batch).expect("the record dropped");
+                    }
+                }
+                self.ops.pop_front();
+            }
             Op::Close => {
+                self.tick();
                 self.plane.finish(self.task, 0).expect("closed");
                 self.ops.pop_front();
             }
@@ -321,6 +367,8 @@ struct Measured {
     /// The engine's wakes of the task, and of them those called as it was about to block.
     bells: u64,
     flushes: u64,
+    /// Of them, the wakes of a sleeping task at a group's deadline.
+    overdue: u64,
     /// Posts to a lingering task that woke it not.
     deferred: u64,
     /// The mean time from a batch's post to the engine's take of its record.
@@ -355,11 +403,17 @@ struct Run {
 /// Runs `ops` on a plane of `group` (the engine's batching), with a task that waits as `waits`
 /// says, a CPU each or one between them: what it measured.
 fn measure(ops: &[Op], costs: Costs, cpus: Cpus, waits: Waits, group: u64) -> Measured {
-    run(ops, costs, cpus, waits, group).m
+    run(ops, costs, cpus, waits, group, false).m
 }
 
-/// [`measure`], the engine and the task kept.
-fn run(ops: &[Op], costs: Costs, cpus: Cpus, waits: Waits, group: u64) -> Run {
+/// [`measure`] with an engine that reads its clock: rule (d), a sleeping task woken a group of
+/// posts at a time.
+fn measure_d(ops: &[Op], costs: Costs, cpus: Cpus, waits: Waits) -> Measured {
+    run(ops, costs, cpus, waits, ring::GROUP, true).m
+}
+
+/// [`measure`], the engine and the task kept; `clock`, whether the engine reads its clock.
+fn run(ops: &[Op], costs: Costs, cpus: Cpus, waits: Waits, group: u64, clock: bool) -> Run {
     let posts = ops.iter().filter(|o| **o == Op::Post).count() as u64;
     let mut plane = RingPlane::new(model(true), 64 << 20);
     plane.spins = 1;
@@ -390,6 +444,7 @@ fn run(ops: &[Op], costs: Costs, cpus: Cpus, waits: Waits, group: u64) -> Run {
         posted: VecDeque::new(),
         post_times: Vec::new(),
         latency: Vec::new(),
+        clock,
     }));
     let map = TaskMap {
         bytes: rings,
@@ -418,6 +473,7 @@ fn run(ops: &[Op], costs: Costs, cpus: Cpus, waits: Waits, group: u64) -> Run {
         task: t.calls,
         bells: c.bells,
         flushes: c.flushes,
+        overdue: c.overdue,
         deferred: c.deferred,
         latency: e.latency.iter().sum::<u64>() / posts.max(1),
         answer: answer / posts.max(1),
@@ -643,7 +699,7 @@ fn a_post_with_no_next_after_it_is_answered_by_the_task_s_deadline() {
     ops.pop();
     ops.extend([Op::Post, Op::Busy(50 * MS), Op::Take, Op::Close]);
     for cpus in [Cpus::Each, Cpus::One] {
-        let r = run(&ops, FAST_TASK, cpus, LINGERS, ring::GROUP);
+        let r = run(&ops, FAST_TASK, cpus, LINGERS, ring::GROUP, false);
         let e = r.engine.borrow();
         let posted = *e.post_times.last().expect("the lone post");
         let answered = *r.task.answered.last().expect("its answer");
@@ -681,7 +737,7 @@ fn the_close_wakes_a_lingering_task_at_once() {
     ops.pop();
     ops.extend([Op::Busy(10 * US), Op::Close]);
     for cpus in [Cpus::Each, Cpus::One] {
-        let r = run(&ops, FAST_TASK, cpus, LINGERS, ring::GROUP);
+        let r = run(&ops, FAST_TASK, cpus, LINGERS, ring::GROUP, false);
         let e = r.engine.borrow();
         assert_eq!(
             r.m.ended,
@@ -905,6 +961,189 @@ fn the_engine_wakes_a_lingering_task_per_group_before_it_blocks_and_at_the_close
     assert_eq!(s.wakes.get(), 5);
 }
 
+/// Rule (d), the defect as the emulator showed it: posts too slow for a lingering task (two do not
+/// fit in `LINGER_MAX_NS`), so the task sleeps between them and, woken at each post, takes one
+/// batch a wake (DS-P steady 1.00 to 1.08 calls a batch, booted). An engine that reads its clock
+/// wakes a sleeping task a group of posts at a time: under a call a batch on each side, on a CPU
+/// each and on one.
+#[test]
+fn a_sleeping_task_is_woken_a_group_of_posts_at_a_time() {
+    for cpus in [Cpus::Each, Cpus::One] {
+        let before = measure(&steady(8), SLOW_POSTS, cpus, LINGERS, ring::GROUP);
+        assert!(
+            before.task_per_batch() >= 100,
+            "{cpus:?}: without a clock, a sleeping task is woken at each post: {before:?}"
+        );
+        let after = measure_d(&steady(8), SLOW_POSTS, cpus, LINGERS);
+        assert!(
+            after.engine_per_batch() < 100 && after.task_per_batch() < 100,
+            "{cpus:?}: rule (d), under a call a batch on each side: {after:?}"
+        );
+        assert!(after.deferred > 0, "{cpus:?}: posts batched: {after:?}");
+    }
+    // With fast posts the task lingers, and rule (d) keeps today's rule: only the first posts,
+    // before the task measured its engine and while it sleeps, are woken a group at a time,
+    // which costs no call more.
+    for cpus in [Cpus::Each, Cpus::One] {
+        let lingers = measure(&steady(8), FAST_TASK, cpus, LINGERS, ring::GROUP);
+        let d = measure_d(&steady(8), FAST_TASK, cpus, LINGERS);
+        assert!(
+            d.engine <= lingers.engine && d.task <= lingers.task && d.deferred >= lingers.deferred,
+            "{cpus:?}: {lingers:?} then {d:?}"
+        );
+    }
+}
+
+/// A stage unit that posts to a sleeping task and returns its worker wakes it as it leaves
+/// (`RingPlane::leave`): the task answers while the engine works elsewhere, and the record is
+/// there when the engine comes back. An engine that left without it would find the batch
+/// unanswered and wait for its compute.
+#[test]
+fn a_unit_that_leaves_wakes_its_sleeping_task() {
+    let mut leaves = lockstep(8);
+    leaves.pop();
+    leaves.extend([Op::Post, Op::Leave, Op::Busy(50 * MS), Op::Take, Op::Close]);
+    let mut silent = lockstep(8);
+    silent.pop();
+    silent.extend([Op::Post, Op::Busy(50 * MS), Op::Take, Op::Close]);
+    let c = SLOW_POSTS;
+    for cpus in [Cpus::Each, Cpus::One] {
+        // On the one CPU the task's answer takes the CPU from the engine's other work.
+        let lent = if cpus == Cpus::One {
+            c.wake + c.compute
+        } else {
+            0
+        };
+        let r = run(&leaves, c, cpus, LINGERS, ring::GROUP, true);
+        assert_eq!(
+            *r.engine.borrow().latency.last().expect("taken"),
+            50 * MS + lent,
+            "{cpus:?}: answered while the engine worked elsewhere: {:?}",
+            r.m
+        );
+        assert!(r.m.flushes >= 1, "{cpus:?}: {:?}", r.m);
+        let r = run(&silent, c, cpus, LINGERS, ring::GROUP, true);
+        assert!(
+            *r.engine.borrow().latency.last().expect("taken") >= 50 * MS + c.compute,
+            "{cpus:?}: without the leave, the engine waits for the compute: {:?}",
+            r.m
+        );
+    }
+}
+
+/// A sleeping task owed a post is woken when the engine looks at the plane (a poll) a group of
+/// its posting intervals after the post, though the group is not complete and the engine does
+/// not block; a look before that wakes no one.
+#[test]
+fn a_look_past_a_group_s_deadline_wakes_a_sleeping_task() {
+    for (busy, overdue) in [(40 * MS, 1), (MS, 0)] {
+        let mut ops = lockstep(8);
+        ops.pop();
+        ops.extend([
+            Op::Post,
+            Op::Busy(busy),
+            Op::Poll,
+            Op::Busy(50 * MS),
+            Op::Take,
+            Op::Close,
+        ]);
+        for cpus in [Cpus::Each, Cpus::One] {
+            let r = run(&ops, SLOW_POSTS, cpus, LINGERS, ring::GROUP, true);
+            assert_eq!(
+                r.m.overdue, overdue,
+                "{cpus:?}, a look {busy} ns after: {:?}",
+                r.m
+            );
+        }
+    }
+}
+
+/// The engine's half of rule (d) on its own: no clock, or no interval measured yet, and each
+/// post wakes a sleeping task; measured, the group's last post wakes it, as does a look or a post
+/// at the group's deadline, a flush, a leave, a window given and the close; a lingering task keeps
+/// its rule, which a leave or a look leaves alone.
+#[test]
+fn the_engine_wakes_a_sleeping_task_a_group_at_a_time_by_its_clock() {
+    let s = Words::new();
+    let g = ring::Geometry::read(&s).expect("header").0;
+    let mut e = ring::Engine::format(&s, g, ring::Mode::Protect, 0);
+    let t = task(&s);
+    let mut cookie = 0;
+    let mut post = |e: &mut ring::Engine, now: Option<u64>| {
+        cookie += 1;
+        let entry = ring::InEntry {
+            offset: 0,
+            len: 4096,
+            cookie,
+            rows: 1,
+        };
+        assert!(e.post(&s, entry));
+        e.ring_at(&s, ring::GROUP, now)
+    };
+    let sleep = || t.arm(&s, Rest::Sleep(FOREVER), |_| false).expect("armed");
+    // No clock: each post wakes a sleeping task.
+    sleep();
+    assert!(post(&mut e, None));
+    // A clock, no interval measured yet: the post wakes it.
+    sleep();
+    assert!(post(&mut e, Some(MS)));
+    assert_eq!(e.posting_interval(), None);
+    // An awake task: nothing owed.
+    assert!(!post(&mut e, Some(2 * MS)));
+    assert_eq!((e.owed(), e.posting_interval()), (0, Some(MS)));
+    // Measured: the group's first post is deferred, its last wakes the task.
+    sleep();
+    assert!(!post(&mut e, Some(3 * MS)));
+    assert_eq!(e.owed(), 1);
+    assert!(
+        !e.due(&s, ring::GROUP, 4 * MS),
+        "before the group's deadline"
+    );
+    assert!(post(&mut e, Some(4 * MS)));
+    assert_eq!(e.owed(), 0);
+    // A look at the group's deadline wakes it: two intervals after the first post owed.
+    sleep();
+    assert!(!post(&mut e, Some(5 * MS)));
+    assert!(!e.due(&s, ring::GROUP, 6 * MS));
+    assert!(e.due(&s, ring::GROUP, 7 * MS));
+    // A post past the deadline wakes it too, before the group is complete.
+    sleep();
+    assert!(
+        !e.ring_at(&s, 3, Some(8 * MS)),
+        "the bell raised again: deferred"
+    );
+    assert!(e.ring_at(&s, 3, Some(20 * MS)), "past three intervals");
+    // The engine leaves, or blocks: a sleeping task owed posts is woken.
+    sleep();
+    assert!(!post(&mut e, Some(21 * MS)));
+    assert!(e.leave(&s));
+    assert!(!e.leave(&s), "once");
+    sleep();
+    assert!(!post(&mut e, Some(22 * MS)));
+    assert!(e.flush(&s));
+    // A look finds the task awake: nothing owed.
+    sleep();
+    assert!(!post(&mut e, Some(23 * MS)));
+    Task::disarm(&s);
+    assert!(!e.due(&s, ring::GROUP, 90 * MS));
+    assert_eq!(e.owed(), 0);
+    // A lingering task keeps its rule: a leave or a look leaves it to its deadline; a flush
+    // wakes it.
+    t.arm(&s, Rest::Linger(FOREVER), |_| false).expect("armed");
+    assert!(!post(&mut e, Some(24 * MS)));
+    assert!(!e.leave(&s));
+    assert!(!e.due(&s, ring::GROUP, 90 * MS));
+    assert!(e.flush(&s));
+    // A window given and the close still wake a sleeping task at once.
+    sleep();
+    assert!(!post(&mut e, Some(25 * MS)));
+    assert!(e.ring_given(&s));
+    assert_eq!(e.owed(), 0);
+    sleep();
+    e.close(&s);
+    assert!(e.ring_now(&s));
+}
+
 /// The task's half: a wait that finds what it waits for once it is said makes no call and leaves
 /// the word clear; the word says how it waits.
 #[test]
@@ -983,45 +1222,57 @@ fn the_task_measures_its_engine_s_posting_interval() {
 /// engine and the task (`cargo test -p moruna-plane measures -- --nocapture`).
 #[test]
 fn measures_the_candidate_rules() {
-    let rules: [(&str, Waits, u64); 6] = [
-        ("before: the task sleeps", Waits::Sleeps, ring::GROUP),
-        ("an old engine, lingering task", LINGERS, 1),
-        ("linger, group 2", LINGERS, 2),
-        ("linger, group 4", Waits::Lingers(4), 4),
-        ("linger, group 8", Waits::Lingers(8), 8),
-        ("spin 2 intervals, then sleep", Waits::Spins(2), ring::GROUP),
+    let rules: [(&str, Waits, u64, bool); 7] = [
+        ("before: the task sleeps", Waits::Sleeps, ring::GROUP, false),
+        ("an old engine, lingering task", LINGERS, 1, false),
+        ("linger, group 2", LINGERS, 2, false),
+        ("linger, group 4", Waits::Lingers(4), 4, false),
+        ("linger, group 8", Waits::Lingers(8), 8, false),
+        (
+            "spin 2 intervals, then sleep",
+            Waits::Spins(2),
+            ring::GROUP,
+            false,
+        ),
+        ("linger 2, rule (d)", LINGERS, ring::GROUP, true),
     ];
     let mut elsewhere = steady(1);
     elsewhere.pop();
+    let mut leaves = elsewhere.clone();
     for _ in 0..16 {
         elsewhere.extend([Op::Post, Op::Busy(400 * US), Op::Take]);
+        leaves.extend([Op::Post, Op::Leave, Op::Busy(400 * US), Op::Take]);
     }
     elsewhere.push(Op::Close);
-    let programs: [(&str, Vec<Op>); 4] = [
+    leaves.push(Op::Close);
+    let programs: [(&str, Vec<Op>); 5] = [
         ("DS-P steady", steady(8)),
         ("stage, 3 in flight", stage(256)),
         ("lockstep", lockstep(64)),
         ("posted, engine elsewhere", elsewhere),
+        ("posted, the unit leaves", leaves),
     ];
-    for cpus in [Cpus::Each, Cpus::One] {
-        for (program, ops) in &programs {
-            for (rule, waits, group) in rules {
-                let m = measure(ops, FAST_TASK, cpus, waits, group);
-                assert_eq!(
-                    m.batches,
-                    ops.iter().filter(|o| **o == Op::Post).count() as u64
-                );
-                std::println!(
-                    "{cpus:?} | {program} | {rule} | engine {}.{:02} task {}.{:02} calls a batch | answered {} us, taken {} us after the post | all in {} us | spun {} us",
-                    m.engine_per_batch() / 100,
-                    m.engine_per_batch() % 100,
-                    m.task_per_batch() / 100,
-                    m.task_per_batch() % 100,
-                    m.answer / US,
-                    m.latency / US,
-                    m.elapsed / US,
-                    m.spun / US,
-                );
+    for (costs, c) in [("fast posts", FAST_TASK), ("slow posts", SLOW_POSTS)] {
+        for cpus in [Cpus::Each, Cpus::One] {
+            for (program, ops) in &programs {
+                for (rule, waits, group, clock) in rules {
+                    let m = run(ops, c, cpus, waits, group, clock).m;
+                    assert_eq!(
+                        m.batches,
+                        ops.iter().filter(|o| **o == Op::Post).count() as u64
+                    );
+                    std::println!(
+                        "{costs} | {cpus:?} | {program} | {rule} | engine {}.{:02} task {}.{:02} calls a batch | answered {} us, taken {} us after the post | all in {} us | spun {} us",
+                        m.engine_per_batch() / 100,
+                        m.engine_per_batch() % 100,
+                        m.task_per_batch() / 100,
+                        m.task_per_batch() % 100,
+                        m.answer / US,
+                        m.latency / US,
+                        m.elapsed / US,
+                        m.spun / US,
+                    );
+                }
             }
         }
     }
