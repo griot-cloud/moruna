@@ -228,6 +228,10 @@ pub struct RingTaskModel {
     bell: Option<u32>,
     /// Wakes it called on the engine's bell.
     pub engine_wakes: u64,
+    /// Unmap mode: out of input, it keeps its rings object with the records it posted on it,
+    /// neither handing it back nor waiting, as a task still at work on something else does
+    /// (item 6.3x).
+    pub keeps: bool,
 }
 
 impl RingTaskModel {
@@ -254,6 +258,7 @@ impl RingTaskModel {
             bells: true,
             bell: None,
             engine_wakes: 0,
+            keeps: false,
         }
     }
 
@@ -455,6 +460,9 @@ impl RingTaskModel {
                             return true;
                         }
                         if ring.mode == Mode::Unmap && self.posted_since_put > 0 {
+                            if self.keeps {
+                                return did;
+                            }
                             self.hand_back();
                             return true;
                         }

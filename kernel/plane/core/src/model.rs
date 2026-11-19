@@ -94,6 +94,9 @@ pub struct Model {
     /// it; nothing by default. The model runs one call at a time, so a test that needs the task
     /// to move between two of the engine's reads in one look puts its step here (item 6.3x).
     pub during_protect: Option<Beside>,
+    /// What a task does while the engine waits on its slots and ports (`wait`), as a test sets
+    /// it; nothing by default: a step that comes after the engine's look and before its next.
+    pub during_wait: Option<Beside>,
 }
 
 /// A test's step of a task, run beside one of the engine's calls ([`Model::during_protect`]).
@@ -120,6 +123,7 @@ impl Default for Model {
             futex: Rc::new(core::cell::Cell::new(0)),
             clock: None,
             during_protect: None,
+            during_wait: None,
         }
     }
 }
@@ -283,6 +287,9 @@ impl Calls for Model {
         _deadline: u64,
     ) -> Result<Ready, Error> {
         self.calls += 1;
+        if let Some(beside) = self.during_wait.clone() {
+            (beside.0)();
+        }
         let ready = slots
             .iter()
             .any(|s| !s.borrow().events.is_empty() || s.borrow().ended)

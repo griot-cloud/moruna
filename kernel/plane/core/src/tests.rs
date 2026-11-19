@@ -672,13 +672,23 @@ fn dp_ring_conformance_passes_on_the_kernel_model() {
     }
 }
 
-/// Item 6.3x, the defect as a test: a release the engine reads after the group it took gives a
-/// batch done before that batch's record (`RingPlane::release_ahead_of`'s second read, given
-/// by `emit_released`). Fails until the PM decides the fix.
+/// Item 6.3x, DP-I10 in protect mode: a release the engine reads after the group it took (the
+/// second read of `RingPlane::release_ahead_of`) waits for the next look, which takes its
+/// batch's record first. It gave the batch done before its record.
 #[test]
 fn p_6_3x_a_record_comes_before_its_release_when_the_task_answers_during_a_revoke() {
     let f = fixtures();
     if let Err(e) = crate::ring_conformance::answers_in_order_across_a_revoke(&f) {
+        panic!("{e}");
+    }
+}
+
+/// Item 6.3x, DP-I10 in unmap mode: a release read while its record is still posted on the
+/// object the task holds waits for the hand-back (`RingPlane::records_taken`).
+#[test]
+fn p_6_3x_a_release_waits_for_its_record_s_hand_back_in_unmap_mode() {
+    let f = fixtures();
+    if let Err(e) = crate::ring_conformance::a_release_waits_for_its_record_s_hand_back(&f) {
         panic!("{e}");
     }
 }
