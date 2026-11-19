@@ -225,8 +225,8 @@ impl Ring {
 
     /// `TaskState::take_oldest` and `TaskState::took`: the answer to the oldest piece in flight,
     /// waited for, to its morsel. The function runs here: its piece's columns, and their first
-    /// two added. Its task stamps the piece's function time on its answer, as a ring task will
-    /// (item 6.3z); the kernel's own reports none yet, so its morsels give the cost model nothing.
+    /// two added. Its task gives the piece's function time with its answer, as a ring task gives
+    /// it on its release (item 6.3z).
     fn take_oldest(&mut self) -> moruna_kernel::Result<()> {
         let piece = self
             .in_flight

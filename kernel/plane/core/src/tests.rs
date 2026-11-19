@@ -160,7 +160,8 @@ fn dp_t2_fan_out_is_shares_of_one_batch_freed_once_after_the_last() {
         assert!(seen.contains(&Event::Released {
             task: *task,
             input: 0,
-            batch
+            batch,
+            piece_ns: None
         }));
     }
     assert_eq!(p.residency().shares, 0);

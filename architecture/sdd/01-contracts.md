@@ -560,8 +560,8 @@ pub struct KernelHints {
 /// Per-instance state a stateful kernel keeps between `apply` calls.
 /// A morsel a unit completed (6.3m): its number, its output, and how long it took, as the cost
 /// model is told it: `Unit` (the unit's own time, as the scheduler measures it), `Given` (wall
-/// and CPU nanoseconds the kernel measured), or `Untimed` (no observation; a ring task reports
-/// no time per piece until item 6.3z).
+/// and CPU nanoseconds the kernel measured: a ring stage's pieces' times, item 6.3z), or
+/// `Untimed` (no observation: a morsel one of whose pieces came with no time).
 pub struct Completed { pub seq: Seq, pub output: Payload, pub time: MorselTime }
 pub enum MorselTime { Unit, Given { wall_ns: u64, cpu_ns: u64 }, Untimed }
 

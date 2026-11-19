@@ -774,7 +774,7 @@ impl ImageTask {
                 );
                 Err(st.failed(&cause))
             }
-            Seen::Released(_) => Err(kernel_error(format!(
+            Seen::Released(..) => Err(kernel_error(format!(
                 "image `{}`: a release where a record was waited for",
                 self.name
             ))),
@@ -1009,8 +1009,8 @@ impl ImageTask {
             st.applying = true;
         }
         if st.taking.is_some() {
-            let answer = st.take_oldest(ports, names)?;
-            st.took(answer)?;
+            let (answer, piece_ns) = st.take_oldest(ports, names)?;
+            st.took(answer, piece_ns)?;
             let laid = lock(&self.busy.warm).laid.take();
             if let Some(laid) = laid {
                 self.reading(st, laid);
@@ -1035,8 +1035,8 @@ impl ImageTask {
                 }
                 warm.laid = Some(laid);
             }
-            let answer = st.take_oldest(ports, names)?;
-            st.took(answer)?;
+            let (answer, piece_ns) = st.take_oldest(ports, names)?;
+            st.took(answer, piece_ns)?;
             lock(&self.busy.warm).laid = None;
             self.reading(st, laid);
         }
@@ -1689,19 +1689,24 @@ impl KernelState for TaskState {
 /// What a task's wait saw.
 enum Seen {
     Put(BatchId),
-    /// The task released this batch: it is done with it (ring mode).
-    Released(BatchId),
+    /// The task released this batch: it is done with it (ring mode). With the function time it
+    /// gave the batch on its release, if it gave one (item 6.3z).
+    Released(BatchId, Option<u64>),
     Ended,
 }
 
 /// An answer being taken: the batch it answers, its records taken so far (each decoded as it
 /// came, so its window cycles for the next part), the record the run's arena refused, to take
-/// first when the unit is applied again, and whether the task has released the batch.
+/// first when the unit is applied again, whether the task has released the batch, and the
+/// function time the task gave it on that release (item 6.3z). An answer let go before it is
+/// taken (a restart's [`TaskState::unanswered`]) lets its time go with it: the batch posted again
+/// is timed as it runs again.
 struct Taking {
     offered: BatchId,
     parts: Vec<Payload>,
     refused: Option<BatchId>,
     released: bool,
+    piece_ns: Option<u64>,
 }
 
 /// A mapping of a batch the engine holds, owning the pages an Arrow buffer points into.
@@ -2045,10 +2050,10 @@ impl TaskState {
             && self
                 .early
                 .iter()
-                .any(|seen| matches!(seen, Seen::Released(b) if *b == oldest))
+                .any(|seen| matches!(seen, Seen::Released(b, _) if *b == oldest))
         {
-            let answer = self.take_oldest(ports, names)?;
-            self.took(answer)?;
+            let (answer, piece_ns) = self.take_oldest(ports, names)?;
+            self.took(answer, piece_ns)?;
         }
         // The parts of the answer the task is still writing, as far as they have come.
         if matches!(self.early.front(), Some(Seen::Put(_)))
@@ -2063,6 +2068,7 @@ impl TaskState {
                     parts: Vec::new(),
                     refused: None,
                     released: false,
+                    piece_ns: None,
                 },
             };
             while let Some(&Seen::Put(out)) = self.early.front() {
@@ -2143,8 +2149,10 @@ impl TaskState {
                 let _ = self.plane.drop_batch(batch);
                 Err(self.failed("it put a record before it was offered a batch"))
             }
-            Some(Event::Released { batch, .. }) if self.outstanding() > 0 => {
-                self.early.push_back(Seen::Released(batch));
+            Some(Event::Released {
+                batch, piece_ns, ..
+            }) if self.outstanding() > 0 => {
+                self.early.push_back(Seen::Released(batch, piece_ns));
                 Ok(true)
             }
             Some(Event::Released { .. } | Event::Freed { .. }) => Ok(true),
@@ -2310,7 +2318,7 @@ impl TaskState {
     fn wait(&mut self, ports: Option<&Arc<StagePorts>>, names: &[String]) -> Result<Seen> {
         loop {
             match self.wait_any(ports, names)? {
-                Seen::Released(_) => {}
+                Seen::Released(..) => {}
                 seen => return Ok(seen),
             }
         }
@@ -2350,8 +2358,11 @@ impl TaskState {
                     self.received += 1;
                     self.part(t, out)?;
                 }
-                Seen::Released(b) if b == t.offered => t.released = true,
-                Seen::Released(_) => {}
+                Seen::Released(b, piece_ns) if b == t.offered => {
+                    t.released = true;
+                    t.piece_ns = piece_ns;
+                }
+                Seen::Released(..) => {}
                 Seen::Ended => {
                     let cause = format!(
                         "it ended after answering {} of the {} batches it was sent",
@@ -2413,9 +2424,10 @@ impl TaskState {
     /// to make room for pieces still queued, since it returns with none queued
     /// ([`layout::QUEUED_MAX`]); a unit that completed no morsel gives none, and its morsel
     /// comes with a later unit, or at the stage's end. A morsel of [`layout::IN_FLIGHT`] pieces
-    /// is posted at once, so one engine worker keeps every task of the stage busy. The task
-    /// stamps no time on its pieces yet (item 6.3z), so a morsel is given untimed: the cost model
-    /// learns nothing of it rather than a wrong figure (6.3m, decision 4).
+    /// is posted at once, so one engine worker keeps every task of the stage busy. A morsel is
+    /// given with its pieces' function times summed when the task gave one on every piece's
+    /// release (item 6.3z), and untimed otherwise: the cost model learns nothing of it rather than
+    /// a wrong figure (6.3m, decision 4).
     ///
     /// The stage's first unit is the exception: it answers its whole morsel
     /// ([`layout::answers_whole`]). The controller's probe is that unit, and what it took and
@@ -2454,14 +2466,14 @@ impl TaskState {
             self.whole = layout::answers_whole(self.schema.is_some());
         }
         if self.taking.is_some() {
-            let answer = self.take_oldest(ports, names)?;
-            self.took(answer)?;
+            let (answer, piece_ns) = self.take_oldest(ports, names)?;
+            self.took(answer, piece_ns)?;
         }
         self.feed(ports, names)?;
         // No answer has come yet: every answer taken gives its schema.
         if self.schema.is_none() {
-            let answer = self.take_oldest(ports, names)?;
-            self.took(answer)?;
+            let (answer, piece_ns) = self.take_oldest(ports, names)?;
+            self.took(answer, piece_ns)?;
             self.feed(ports, names)?;
         }
         loop {
@@ -2473,10 +2485,10 @@ impl TaskState {
                 && self
                     .early
                     .iter()
-                    .any(|seen| matches!(seen, Seen::Released(b) if *b == oldest))
+                    .any(|seen| matches!(seen, Seen::Released(b, _) if *b == oldest))
             {
-                let answer = self.take_oldest(ports, names)?;
-                self.took(answer)?;
+                let (answer, piece_ns) = self.take_oldest(ports, names)?;
+                self.took(answer, piece_ns)?;
                 came = true;
             }
             self.feed(ports, names)?;
@@ -2484,8 +2496,8 @@ impl TaskState {
             // and under memory pressure no unit may come to post it ([`layout::QUEUED_MAX`]).
             // And the stage's first unit leaves nothing in flight: it answers its whole morsel.
             if layout::waits_for_answer(self.queued.len(), self.outstanding(), self.whole) {
-                let answer = self.take_oldest(ports, names)?;
-                self.took(answer)?;
+                let (answer, piece_ns) = self.take_oldest(ports, names)?;
+                self.took(answer, piece_ns)?;
                 self.feed(ports, names)?;
             } else if !came {
                 break;
@@ -2505,12 +2517,14 @@ impl TaskState {
         Ok(given)
     }
 
-    /// An answer taken, to its morsel ([`layout::Morsels::answer`]); the morsel to those to give
-    /// when it was its last piece. The task stamps no time on a piece (item 6.3z).
-    fn took(&mut self, answer: Payload) -> Result<()> {
+    /// An answer taken, to its morsel ([`layout::Morsels::answer`]), with the piece's function
+    /// time the task gave on its release (item 6.3z): its wall and CPU time alike, since a piece
+    /// is the task's own single-threaded work. The morsel to those to give when it was its last
+    /// piece.
+    fn took(&mut self, answer: Payload, piece_ns: Option<u64>) -> Result<()> {
         let whole = self
             .morsels
-            .answer(answer, None)
+            .answer(answer, piece_ns.map(|ns| (ns, ns)))
             .map_err(|why| kernel_error(format!("image `{}`: {why}", self.name)))?;
         if let Some(whole) = whole {
             self.done.push_back(whole);
@@ -2607,11 +2621,12 @@ impl TaskState {
     }
 
     /// The answer to the oldest batch in flight, waited for; or the one a refusal interrupted.
+    /// With the function time the task gave the batch on its release, if it gave one (item 6.3z).
     fn take_oldest(
         &mut self,
         ports: Option<&Arc<StagePorts>>,
         names: &[String],
-    ) -> Result<Payload> {
+    ) -> Result<(Payload, Option<u64>)> {
         let mut taking = match self.taking.take() {
             Some(taking) => taking,
             None => Taking {
@@ -2621,6 +2636,7 @@ impl TaskState {
                 parts: Vec::new(),
                 refused: None,
                 released: false,
+                piece_ns: None,
             },
         };
         let answer = match self.answers(&mut taking, ports, names) {
@@ -2643,7 +2659,7 @@ impl TaskState {
             lock(&self.busy.schema).get_or_insert_with(|| Arc::clone(&schema));
             self.schema = Some(schema);
         }
-        Ok(answer)
+        Ok((answer, taking.piece_ns))
     }
 
     /// `batch` as the records the engine lays out for the task: itself when its record fits a
@@ -2705,7 +2721,9 @@ impl TaskState {
                     self.window = None;
                     self.early.push_back(Seen::Put(batch));
                 }
-                Some(Event::Released { batch, .. }) => self.early.push_back(Seen::Released(batch)),
+                Some(Event::Released {
+                    batch, piece_ns, ..
+                }) => self.early.push_back(Seen::Released(batch, piece_ns)),
                 Some(Event::Ended { .. }) => {
                     self.early.push_back(Seen::Ended);
                     return Ok(());
@@ -2799,7 +2817,9 @@ impl TaskState {
                     request,
                 }) => self.call(ports, names, call, port, request)?,
                 Some(Event::Ended { .. }) => return Ok(Seen::Ended),
-                Some(Event::Released { batch, .. }) => return Ok(Seen::Released(batch)),
+                Some(Event::Released {
+                    batch, piece_ns, ..
+                }) => return Ok(Seen::Released(batch, piece_ns)),
                 Some(Event::Freed { .. }) => {}
                 None => {
                     if self.cancelled() {
@@ -3006,8 +3026,8 @@ impl Kernel for ImageTask {
                 if st.in_flight.is_empty() && st.taking.is_none() {
                     break;
                 }
-                let answer = st.take_oldest(self.ports.get(), &self.port_names)?;
-                st.took(answer)?;
+                let (answer, piece_ns) = st.take_oldest(self.ports.get(), &self.port_names)?;
+                st.took(answer, piece_ns)?;
             }
             let rest = st.give()?;
             st.plane
@@ -3029,7 +3049,7 @@ impl Kernel for ImageTask {
                     };
                     Err(st.failed(&cause))
                 }
-                Seen::Released(_) => Err(st.failed("it released a batch it was not sent")),
+                Seen::Released(..) => Err(st.failed("it released a batch it was not sent")),
                 Seen::Ended => match st.answer(END_SECONDS * SECONDS) {
                     Some(Ok(e)) if e.how == how::EXITED && e.code == 0 => {
                         let (served, refused) = (e.served, e.refused.clone());

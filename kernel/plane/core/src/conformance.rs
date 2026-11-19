@@ -425,6 +425,7 @@ fn put_get<H: Harness>(h: &mut H, f: &Fixtures) -> Result<(), String> {
         task: consumer,
         input: 0,
         batch,
+        piece_ns: None,
     }) {
         return Err(format!("no release of the batch: {:?}", log.events));
     }
@@ -500,6 +501,7 @@ fn fan_out<H: Harness>(h: &mut H, f: &Fixtures) -> Result<(), String> {
             task,
             input: 0,
             batch,
+            piece_ns: None,
         }) {
             return Err(format!("consumer {task:?} released nothing"));
         }
@@ -793,6 +795,7 @@ fn consumer_write<H: Harness>(h: &mut H, f: &Fixtures) -> Result<(), String> {
         task: writer,
         input: 0,
         batch,
+        piece_ns: None,
     }) {
         return Err(format!(
             "the faulted consumer's share was not released: {:?}",
@@ -849,6 +852,7 @@ fn crash<H: Harness>(h: &mut H, f: &Fixtures) -> Result<(), String> {
                 task,
                 input: 0,
                 batch,
+                piece_ns: None,
             }
         }),
         3,
@@ -916,6 +920,7 @@ fn kill<H: Harness>(h: &mut H, f: &Fixtures) -> Result<(), String> {
                 task,
                 input: 0,
                 batch,
+                piece_ns: None,
             }
         }),
         2,

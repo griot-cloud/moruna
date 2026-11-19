@@ -297,6 +297,24 @@ fn sc_p_a_ring_stage_s_unit_is_observed_with_its_own_output() {
         wrong.len(),
         kept.len()
     );
+    // Item 6.3z: each morsel's time is what its task measured of its pieces and gave on their
+    // releases, through the plane's path as the kernel's task takes it: its wall and CPU time
+    // alike, and at least the function's work on one piece.
+    let untimed: Vec<String> = kept
+        .iter()
+        .filter_map(|o| {
+            let (wall, cpu) = (
+                o.outcome.get(Target::Duration)?,
+                o.outcome.get(Target::WorkerTime)?,
+            );
+            (wall != cpu || wall < WORK.as_secs_f64())
+                .then(|| format!("wall {wall:.6} s, cpu {cpu:.6} s"))
+        })
+        .collect();
+    assert!(
+        untimed.is_empty(),
+        "every morsel is timed by its task's pieces, at least {WORK:?} each: {untimed:?}"
+    );
     // What it then says of a morsel of the stage.
     let bytes = MORSEL * 8;
     let predicted = online
