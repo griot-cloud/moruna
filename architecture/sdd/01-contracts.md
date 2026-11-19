@@ -558,6 +558,13 @@ pub struct KernelHints {
 }
 
 /// Per-instance state a stateful kernel keeps between `apply` calls.
+/// A morsel a unit completed (6.3m): its number, its output, and how long it took, as the cost
+/// model is told it: `Unit` (the unit's own time, as the scheduler measures it), `Given` (wall
+/// and CPU nanoseconds the kernel measured), or `Untimed` (no observation; a ring task reports
+/// no time per piece until item 6.3z).
+pub struct Completed { pub seq: Seq, pub output: Payload, pub time: MorselTime }
+pub enum MorselTime { Unit, Given { wall_ns: u64, cpu_ns: u64 }, Untimed }
+
 pub trait KernelState: Send {
     fn as_any_mut(&mut self) -> &mut dyn core::any::Any;
     /// Serialise the state for the run manifest. Called only when the kernel's
@@ -613,6 +620,18 @@ pub trait Kernel: Send + Sync + 'static {
     /// `apply`'s, numbered from the stage's finish base (d.16); `None` gives nothing; an `Err`
     /// ends the run as a kernel's failure. The default gives nothing.
     fn finish(&self, state: &mut dyn KernelState) -> Result<Option<Payload>> { let _ = state; Ok(None) }
+    /// The morsels a unit completed, each under its own number (amended 2026-11-19, item 6.3m;
+    /// SDD 30 d.4). A pipelined kernel answers a morsel in later units, so a unit may complete
+    /// none, its own, or earlier ones; the scheduler pushes each under its `seq` and records
+    /// its trace, its growth and its cost observation then, never per unit. Called on
+    /// single-input stages, where `apply_port(0)` was. The default gives the unit's own morsel,
+    /// as `apply` did, timed as the unit.
+    fn apply_morsels(&self, state: &mut dyn KernelState, input: Payload, seq: Seq)
+        -> Result<Vec<Completed>> { Ok(vec![Completed::unit(seq, self.apply(state, input)?)]) }
+    /// The morsels still open at the end of the input, each under its own number; a number the
+    /// stage was never given, or gave already, ends the run as a kernel error. The default gives
+    /// `finish`'s payload under `after` (d.16).
+    fn finish_morsels(&self, state: &mut dyn KernelState, after: Seq) -> Result<Vec<Completed>>;
     /// Whether the kernel joins its inputs by morsel (d.16; 0.6.1): the stage hands it the
     /// morsel of one number from every port at once, through `apply_aligned`, and its output
     /// keeps that number. Default false.
