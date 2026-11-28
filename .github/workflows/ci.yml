@@ -24,7 +24,7 @@ permissions: {}
 
 jobs:
   publish:
-    runs-on: ubuntu-latest
+    runs-on: [self-hosted, moruna-release-080-f39c783873db]
     timeout-minutes: 10
     environment: pypi
     permissions:
