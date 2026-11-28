@@ -2,6 +2,11 @@ name: Publish verified Moruna wheels
 on:
   workflow_dispatch:
     inputs:
+      probe:
+        description: Check whether the publisher runner can start
+        required: false
+        type: boolean
+        default: false
       staging_tag:
         description: Private draft release carrying the Azure artifact
         required: true
@@ -26,7 +31,11 @@ jobs:
       contents: write
       id-token: write
     steps:
+      - name: Confirm that the publish-only runner starts
+        if: inputs.probe
+        run: echo Publisher runner is available
       - name: Fetch the retained Azure wheel set from the private release draft
+        if: ${{ !inputs.probe }}
         env:
           GH_TOKEN: ${{ github.token }}
           TAG: ${{ inputs.staging_tag }}
@@ -36,6 +45,7 @@ jobs:
           gh release download --repo "$GITHUB_REPOSITORY" --dir staging \
             --pattern '*.whl' --pattern release.json -- "$TAG"
       - name: Verify the source commit and exact wheel digests
+        if: ${{ !inputs.probe }}
         env:
           MANIFEST_SHA256: ${{ inputs.manifest_sha256 }}
           SOURCE_COMMIT: ${{ inputs.source_commit }}
@@ -71,6 +81,7 @@ jobs:
           print(f"Verified {len(actual)} wheels at {record['commit']}")
           PY
       - name: Publish to PyPI with attestations
+        if: ${{ !inputs.probe }}
         uses: pypa/gh-action-pypi-publish@ed0c53931b1dc9bd32cbe73a98c7f6766f8a527e # v1.14.0
         with:
           packages-dir: dist
